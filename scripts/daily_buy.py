@@ -151,7 +151,7 @@ def _process_forecast(
 
     logger.info(
         "  → Nalezen: %s | YES cena: %.1f%%",
-        market.slug, market.yes_price_pct
+        market.market_slug, market.yes_price_pct
     )
 
     # Kontrola: cena by měla být obchodovatelná (0.02–0.98)
@@ -162,7 +162,7 @@ def _process_forecast(
         return {
             "city": forecast.city,
             "action": "SKIPPED",
-            "market_slug": market.slug,
+            "market_slug": market.market_slug,
             "predicted_temp": forecast.predicted_high,
             "unit": forecast.unit,
             "entry_price": entry_price,
@@ -175,7 +175,7 @@ def _process_forecast(
         target_date=target_date,
         predicted_temp=forecast.predicted_high,
         unit=forecast.unit,
-        market_slug=market.slug,
+        market_slug=market.market_slug,
         market_question=market.question,
         entry_price=entry_price,
     )
@@ -184,7 +184,7 @@ def _process_forecast(
         return {
             "city": forecast.city,
             "action": "SKIPPED",
-            "market_slug": market.slug,
+            "market_slug": market.market_slug,
             "predicted_temp": forecast.predicted_high,
             "unit": forecast.unit,
             "entry_price": entry_price,
@@ -195,7 +195,7 @@ def _process_forecast(
         "city": forecast.city,
         "action": "OPENED",
         "trade_id": trade.id,
-        "market_slug": market.slug,
+        "market_slug": market.market_slug,
         "predicted_temp": forecast.predicted_high,
         "unit": forecast.unit,
         "entry_price": entry_price,
@@ -254,3 +254,4 @@ if __name__ == "__main__":
 
     # Exit code
     sys.exit(0 if not result["errors"] else 1)
+      
