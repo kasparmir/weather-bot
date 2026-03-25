@@ -143,17 +143,20 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
         current_price = market.yes_price
         price_change = abs(current_price - trade.current_price)
 
-        # Zkontroluj profit-take podmínku
-        if current_price >= PROFIT_THRESHOLD:
+        # Zkontroluj profit-take podmínku:
+        # Prodej pokud je cena >= 0.50 A zároveň alespoň +5 % nad entry.
+        # Zabraňuje okamžitému prodeji kontraktů koupených blízko (nebo nad) 0.50.
+        min_exit = max(PROFIT_THRESHOLD, trade.entry_price * 1.05)
+        if current_price >= min_exit:
             logger.info(
-                "  🎯 PROFIT TAKE: %.4f >= %.2f | Zahajuji prodej",
-                current_price, PROFIT_THRESHOLD,
+                "  🎯 PROFIT TAKE: %.4f >= %.2f (entry=%.4f +5%%) | Zahajuji prodej",
+                current_price, min_exit, trade.entry_price,
             )
             closed_trade = ledger.close_position(
                 trade_id=trade.id,
                 exit_price=current_price,
                 reason="CLOSED_PROFIT",
-                notes=f"profit-take: cena {current_price:.4f} >= {PROFIT_THRESHOLD}",
+                notes=f"profit-take: {current_price:.4f} >= {min_exit:.4f} (threshold={PROFIT_THRESHOLD}, entry={trade.entry_price:.4f})",
             )
             return {
                 "trade_id": trade.id,
@@ -263,3 +266,4 @@ if __name__ == "__main__":
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     sys.exit(0 if not result["errors"] else 1)
+  
