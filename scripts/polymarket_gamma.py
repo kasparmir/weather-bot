@@ -245,12 +245,16 @@ class PolymarketGamma:
                 resp = client.get(f"{GAMMA_BASE}/events/slug/{slug}")
                 if resp.status_code == 200:
                     data = resp.json()
-                    return (data[0] if isinstance(data, list) else data) or None
+                    if isinstance(data, list):
+                        return data[0] if data else None
+                    return data or None
                 if resp.status_code == 404:
                     resp2 = client.get(f"{GAMMA_BASE}/events", params={"slug": slug})
                     if resp2.status_code == 200:
                         data2 = resp2.json()
-                        return (data2[0] if isinstance(data2, list) else data2) or None
+                        if isinstance(data2, list):
+                            return data2[0] if data2 else None
+                        return data2 or None
             return None
         except Exception as exc:
             logger.debug("_fetch_event_by_slug(%s): %s", slug, exc)
@@ -375,135 +379,87 @@ class PolymarketGamma:
                                 event_id: str, predicted_temp: float,
                                 unit: str) -> Optional[WeatherMarket]:
         """
-        Z listu market raw diktů vybere ten, jehož teplotní práh
-        je nejblíže předpovídané teplotě.
+        Vybere market jehož práh nejlépe odpovídá předpovědi.
 
-        Práh se extrahuje z question textu (regex) nebo ze slugu.
-        Příklady:
-          "Will the high temp in Atlanta exceed 65°F?" → práh = 65
-          "atlanta-exceed-65f-march-25"               → práh = 65
-          "Will high temp in London exceed 12°C?"     → práh = 12
+        Logika výběru:
+          1. °C předpověď se VŽDY zaokrouhlí na celé číslo (15.7 → 16).
+          2. Hledá se exact match zaokrouhleného čísla.
+          3. Pokud exact match neexistuje, vybere nejbližší "X or below"
+             nebo "X or above" kontrakt (opět dle zaokrouhleného čísla).
+
+        Směr kontraktu:
+          - above/exceed/over  → YES = teplota NAD prahem
+          - below/under/orbelow → YES = teplota POD prahem
+
+        Odmítá kontrakt kde forecast je na špatné straně prahu
+        (např. forecast 16°C a market "15°C or below" → YES≈7% → přeskočit).
         """
         import re
 
+        # Pro °C vždy zaokrouhli na celé číslo
+        # Standardní zaokrouhlení (ne banker's): 15.5→16, 16.5→17
+        target = int(predicted_temp + 0.5) if unit.upper() == "C" else predicted_temp
+        logger.info("  Hledám práh: %.1f°%s → cíl=%g°%s",
+                    predicted_temp, unit, target, unit)
+
+        ABOVE_KW = ["exceed", "above", "over", "higher", "more than", "greater"]
+        BELOW_KW = ["below", "under", "orbelow", "or-below", "or below",
+                    "less than", "lower", "at most", "atmost"]
+
+        def detect_direction(question: str, slug: str) -> str:
+            combined = (question + " " + slug).lower()
+            for kw in BELOW_KW:
+                if kw in combined:
+                    return "below"
+            for kw in ABOVE_KW:
+                if kw in combined:
+                    return "above"
+            return "unknown"
+
         def extract_threshold(question: str, slug: str, unit: str) -> Optional[float]:
             u = unit.upper()
-            # Hledej číslo před jednotkou v question nebo slugu
             patterns = [
-                rf"(\d+(?:\.\d+)?)[°\s]*{u}",          # "65°F" nebo "65 F"
-                rf"exceed[\s-](\d+(?:\.\d+)?)",          # "exceed 65" nebo "exceed-65"
-                rf"above[\s-](\d+(?:\.\d+)?)",           # "above 65"
-                rf"(\d+(?:\.\d+)?)-{u.lower()}",          # "65-f" v slugu
-                rf"-(\d+(?:\.\d+)?){u.lower()}-",         # "-65f-" v slugu
-                r"(\d+(?:\.\d+)?)",                        # jakékoliv číslo (fallback)
+                rf"(\d+(?:\.\d+)?)[°\s]*{u}",       # "65°F", "12°C"
+                rf"(\d+(?:\.\d+)?){u.lower()}",        # "65f", "12c"
+                rf"exceed[\s-](\d+(?:\.\d+)?)",
+                rf"above[\s-](\d+(?:\.\d+)?)",
+                rf"below[\s-](\d+(?:\.\d+)?)",
+                rf"-(\d+(?:\.\d+)?)[cf](?:-|$|or)",   # "-15c-", "-15corbelow"
+                rf"-(\d+(?:\.\d+)?)-",                 # "-65-" fallback
             ]
             for text in [question, slug]:
-                for pat in patterns[:-1]:   # zkus specifické patterny nejdřív
+                for pat in patterns:
                     m = re.search(pat, text, re.IGNORECASE)
                     if m:
                         return float(m.group(1))
-            # Fallback: první číslo v question
-            m = re.search(patterns[-1], question)
-            return float(m.group(1)) if m else None
+            return None
 
-        candidates: list[tuple[float, WeatherMarket]] = []
+        # Parsuj všechny aktivní markety
+        parsed: list[tuple[float, str, WeatherMarket]] = []  # (threshold, direction, market)
         for m_raw in (markets_raw or []):
             m = self._parse_market(m_raw, event_slug, event_id)
             if not m or not m.active or m.closed:
                 continue
+            direction = detect_direction(m.question, m.market_slug)
             threshold = extract_threshold(m.question, m.market_slug, unit)
             if threshold is None:
-                # Nemůžeme určit práh — přidej s vysokou vzdáleností
-                candidates.append((9999.0, m))
+                logger.debug("  Přeskočen (práh nenalezen): %s", m.market_slug)
                 continue
-            dist = abs(threshold - predicted_temp)
-            candidates.append((dist, m))
-            logger.debug("  Kandidát: %s | práh=%.1f | předpověď=%.1f | Δ=%.1f",
-                         m.market_slug, threshold, predicted_temp, dist)
+            parsed.append((threshold, direction, m))
+            logger.debug("  Parsován: %s | práh=%g | směr=%s",
+                         m.market_slug, threshold, direction)
 
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        best_dist, best = candidates[0]
-        logger.info("  Vybrán: %s | Δpráh=%.1f°%s", best.market_slug, best_dist, unit)
-        return best
-
-
-    def _parse_market(self, data: dict, event_slug: str = "",
-                      event_id: str = "") -> Optional[WeatherMarket]:
-        if not data or not isinstance(data, dict): return None
-        try:
-            outcomes_raw = data.get("outcomes","[]")       or "[]"
-            prices_raw   = data.get("outcomePrices","[]") or "[]"
-            if isinstance(outcomes_raw, str): outcomes_raw = json.loads(outcomes_raw)
-            if isinstance(prices_raw,   str): prices_raw   = json.loads(prices_raw)
-
-            tokens   = data.get("tokens",[])       or []
-            clob_ids = data.get("clobTokenIds",[]) or []
-            outcomes: list[MarketOutcome] = []
-            for i, name in enumerate(outcomes_raw):
-                price    = float(prices_raw[i]) if i < len(prices_raw) else 0.5
-                token_id = ""
-                if   i < len(tokens)   and isinstance(tokens[i], dict):
-                    token_id = str(tokens[i].get("token_id",""))
-                elif i < len(clob_ids):
-                    token_id = str(clob_ids[i])
-                outcomes.append(MarketOutcome(name=str(name), token_id=token_id, price=price))
-
-            last_trade = float(data.get("lastTradePrice",0) or 0)
-            best_ask   = float(data.get("bestAsk",0) or 0)
-            best_bid   = float(data.get("bestBid",0) or 0)
-            if last_trade == 0 and prices_raw:
-                last_trade = float(prices_raw[0])
-
-            eid   = event_id   or str(data.get("eventId",""))
-            eslug = event_slug or str(data.get("eventSlug",""))
-
-            return WeatherMarket(
-                market_id=str(data.get("id", data.get("conditionId",""))),
-                event_id=eid,
-                event_slug=eslug,
-                market_slug=str(data.get("slug", data.get("marketSlug", eslug))),
-                question=str(data.get("question","")),
-                end_date=str(data.get("endDate", data.get("endDateIso",""))),
-                last_trade_price=last_trade,
-                best_ask=best_ask,
-                best_bid=best_bid,
-                active=bool(data.get("active",True)),
-                closed=bool(data.get("closed",False)),
-                outcomes=outcomes,
-            )
-        except Exception as exc:
-            logger.error("_parse_market: %s | %.200s", exc, str(data))
+        if not parsed:
             return None
 
+        # --- Krok 1: exact match zaokrouhleného čísla ---
+        exact = [(t, d, m) for t, d, m in parsed if t == target]
+        if exact:
+            # Preferuj "above/exceed" u exact matche (přirozenější kontrakt)
+            above_exact = [(t,d,m) for t,d,m in exact if d in ("above","unknown")]
+            chosen = above_exact[0] if above_exact else exact[0]
+            logger.info("  ✓ Exact match: %s | práh=%g°%s | směr=%s",
+                        chosen[2].market_slug, chosen[0], unit, chosen[1])
+            return chosen[2]
 
-# ---------------------------------------------------------------------------
-# CLI test
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-    from datetime import timedelta
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-    gamma = PolymarketGamma()
-    tomorrow = date.today() + timedelta(days=1)
-
-    print(f"\n=== Test Polymarket Gamma API ===")
-    print(f"Target date: {tomorrow}\n")
-
-    print("1. Weather tag ID...")
-    tag_id = gamma.get_weather_tag_id()
-    print(f"   → {tag_id or 'nenalezen'}\n")
-
-    for city, temp, unit in [("new-york",65.0,"F"),("london",12.0,"C"),("chicago",58.0,"F")]:
-        print(f"Hledám: {city} | {temp}°{unit}")
-        m = gamma.find_weather_market(city, tomorrow, temp, unit)
-        if m:
-            print(f"  ✓ slug:     {m.market_slug}")
-            print(f"  ✓ question: {m.question[:80]}")
-            print(f"  ✓ YES:      {m.yes_price_pct:.1f}%")
-        else:
-            print(f"  ✗ Nenalezen (weather market pro {tomorrow} nemusí ještě existovat)")
-        print()
+        # --- Krok 2: nejbližší smysluplný kontrakt --
