@@ -1,24 +1,12 @@
 """
-polymarket_gamma.py — Polymarket Gamma API klient (opravená verze)
-=================================================================
-Dokumentace: https://docs.polymarket.com/developers/gamma-markets-api/fetch-markets-guide
-
-KRITICKÁ OPRAVA: Gamma API NEMÁ parametr ?q= pro textové vyhledávání.
-Správné strategie (dle oficiální dokumentace):
-  1. /events/slug/{slug}               — přesný event slug lookup
-  2. /markets/slug/{slug}              — přesný market slug lookup  
-  3. /events?tag_id=XXX&active=true    — filtrování dle kategorie (tag)
-  4. /events?active=true&closed=false  — kompletní scan s filtrací
-
-Hierarchie Polymarket:
-  Event  (např. "Temperature in New York March 25")
-    └── Market[]  (konkrétní prahové hodnoty, YES/NO kontrakty)
+polymarket_gamma.py — Polymarket Gamma API klient
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -28,9 +16,11 @@ import httpx
 logger = logging.getLogger(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-
 WEATHER_TAG_CANDIDATES = ["weather", "temperature", "climate"]
 _weather_tag_id_cache: Optional[str] = None
+
+ABOVE_KW = ["exceed", "above", "over", "higher", "more than", "greater"]
+BELOW_KW = ["below", "under", "orbelow", "or-below", "or below", "less than", "lower", "at most"]
 
 
 @dataclass
@@ -68,6 +58,7 @@ class WeatherMarket:
 
 
 class PolymarketGamma:
+
     def __init__(self, timeout: int = 15):
         self.timeout = timeout
 
@@ -77,18 +68,18 @@ class PolymarketGamma:
 
     def find_weather_market(self, city_polymarket_name: str, target_date: date,
                             predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
-        # Strategie 1: event slug
-        m = self._strategy_event_slug(city_polymarket_name, target_date)
-        if m: return m
-        # Strategie 2: market slug
+        m = self._strategy_event_slug(city_polymarket_name, target_date, predicted_temp, unit)
+        if m:
+            return m
         m = self._strategy_market_slug(city_polymarket_name, target_date, predicted_temp, unit)
-        if m: return m
-        # Strategie 3: tag filtrování
+        if m:
+            return m
         m = self._strategy_tag_filter(city_polymarket_name, target_date, predicted_temp, unit)
-        if m: return m
-        # Strategie 4: scan aktivních events
+        if m:
+            return m
         m = self._strategy_events_scan(city_polymarket_name, target_date, predicted_temp, unit)
-        if m: return m
+        if m:
+            return m
         logger.warning("✗ Trh nenalezen: %s %s", city_polymarket_name, target_date)
         return None
 
@@ -108,39 +99,40 @@ class PolymarketGamma:
                 return None
             for tag in tags:
                 label = str(tag.get("label", "")).lower()
-                slug  = str(tag.get("slug",  "")).lower()
+                slug = str(tag.get("slug", "")).lower()
                 for c in WEATHER_TAG_CANDIDATES:
                     if c in label or c in slug:
                         tid = str(tag.get("id", ""))
                         logger.info("Weather tag: id=%s label=%s", tid, tag.get("label"))
                         _weather_tag_id_cache = tid
                         return tid
-            logger.warning("Weather tag nenalezen v /tags")
+            logger.warning("Weather tag nenalezen")
             return None
         except Exception as exc:
             logger.error("/tags chyba: %s", exc)
             return None
 
     # ------------------------------------------------------------------
-    # Strategie 1: event slug lookup
+    # Strategie 1: event slug
     # ------------------------------------------------------------------
 
-    def _strategy_event_slug(self, city: str, target_date: date) -> Optional[WeatherMarket]:
+    def _strategy_event_slug(self, city: str, target_date: date,
+                              predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
         for slug in self._generate_event_slugs(city, target_date):
             event = self._fetch_event_by_slug(slug)
             if event:
-                m = self._extract_best_market_from_event(event)
+                m = self._best_market_from_event(event, predicted_temp, unit)
                 if m:
                     logger.info("✓ [event_slug] %s → %s", slug, m.market_slug)
                     return m
         return None
 
     def _generate_event_slugs(self, city: str, target_date: date) -> list[str]:
-        c     = city.lower().replace(" ", "-")
+        c = city.lower().replace(" ", "-")
         month = target_date.strftime("%B").lower()
         mabbr = target_date.strftime("%b").lower()
-        d     = target_date.day
-        y     = target_date.year
+        d = target_date.day
+        y = target_date.year
         return [
             f"highest-temperature-in-{c}-{month}-{d}-{y}",
             f"highest-temperature-in-{c}-on-{month}-{d}-{y}",
@@ -156,25 +148,25 @@ class PolymarketGamma:
         ]
 
     # ------------------------------------------------------------------
-    # Strategie 2: market slug lookup
+    # Strategie 2: market slug
     # ------------------------------------------------------------------
 
     def _strategy_market_slug(self, city: str, target_date: date,
                                predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
-        c     = city.lower().replace(" ", "-")
-        t     = int(round(predicted_temp))
+        c = city.lower().replace(" ", "-")
+        # Standardní zaokrouhlení pro obě jednotky (bez banker's rounding)
+        t = int(predicted_temp + 0.5) if unit.upper() == "C" else int(predicted_temp + 0.5)
         month = target_date.strftime("%B").lower()
-        d     = target_date.day
-        y     = target_date.year
-        u     = unit.lower()
-        slugs = [
+        d = target_date.day
+        y = target_date.year
+        u = unit.lower()
+        for slug in [
             f"will-the-high-temperature-in-{c}-exceed-{t}{u}-on-{month}-{d}",
             f"will-the-high-temperature-in-{c}-exceed-{t}{u}-on-{month}-{d}-{y}",
             f"will-high-temperature-in-{c}-exceed-{t}{u}-{month}-{d}-{y}",
             f"highest-temperature-in-{c}-on-{month}-{d}-{y}",
             f"will-the-high-temperature-in-{c}-be-above-{t}{u}-on-{month}-{d}",
-        ]
-        for slug in slugs:
+        ]:
             m = self._fetch_market_by_slug(slug)
             if m and m.active and not m.closed:
                 logger.info("✓ [market_slug] %s", slug)
@@ -186,7 +178,7 @@ class PolymarketGamma:
     # ------------------------------------------------------------------
 
     def _strategy_tag_filter(self, city: str, target_date: date,
-                          predicted_temp: float = 0.0, unit: str = "F") -> Optional[WeatherMarket]:
+                              predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
         tag_id = self.get_weather_tag_id()
         if not tag_id:
             return None
@@ -206,11 +198,11 @@ class PolymarketGamma:
             return None
 
     # ------------------------------------------------------------------
-    # Strategie 4: scan events
+    # Strategie 4: scan
     # ------------------------------------------------------------------
 
     def _strategy_events_scan(self, city: str, target_date: date,
-                               predicted_temp: float = 0.0, unit: str = "F",
+                               predicted_temp: float, unit: str,
                                max_pages: int = 5) -> Optional[WeatherMarket]:
         limit = 50
         for page in range(max_pages):
@@ -280,14 +272,13 @@ class PolymarketGamma:
             return None
 
     # ------------------------------------------------------------------
-    # Parsování
+    # Pomocné metody pro výběr marketu
     # ------------------------------------------------------------------
 
-    def _find_in_events(self, events: list[dict], city: str,
-                        target_date: date, predicted_temp: float = 0.0,
-                        unit: str = "F") -> Optional[WeatherMarket]:
+    def _find_in_events(self, events: list[dict], city: str, target_date: date,
+                        predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
         city_lower = city.lower().replace("-", " ")
-        date_strs  = [
+        date_strs = [
             target_date.strftime("%B %-d").lower(),
             target_date.strftime("%b %-d").lower(),
             target_date.strftime("%Y-%m-%d"),
@@ -298,168 +289,249 @@ class PolymarketGamma:
         best_market: Optional[WeatherMarket] = None
 
         for event in events:
-            if not isinstance(event, dict): continue
-            if event.get("closed") or not event.get("active", True): continue
-
-            combined = (str(event.get("slug","")) + " " + str(event.get("title",""))).lower()
-            has_city    = (city_lower in combined or city_lower.replace(" ","-") in combined)
-            has_weather = any(kw in combined for kw in ["temperature","temp","weather","high","heat"])
-            if not (has_city and has_weather): continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("closed") or not event.get("active", True):
+                continue
+            combined = (str(event.get("slug", "")) + " " + str(event.get("title", ""))).lower()
+            has_city = city_lower in combined or city_lower.replace(" ", "-") in combined
+            has_weather = any(kw in combined for kw in ["temperature", "temp", "weather", "high", "heat"])
+            if not (has_city and has_weather):
+                continue
 
             score = 10 if has_city else 0
             for ds in date_strs:
-                if ds in combined: score += 8; break
-            if month_str in combined: score += 3
-            for kw in ["temperature","highest","daily high"]:
-                if kw in combined: score += 2
+                if ds in combined:
+                    score += 8
+                    break
+            if month_str in combined:
+                score += 3
+            for kw in ["temperature", "highest", "daily high"]:
+                if kw in combined:
+                    score += 2
 
             if score > best_score:
-                eslug = str(event.get("slug",""))
-                eid   = str(event.get("id",""))
-                markets_raw = event.get("markets") or []
-                m = self._closest_to_prediction(
-                    markets_raw, eslug, eid, predicted_temp, unit)
-                if not m and not markets_raw:
+                eslug = str(event.get("slug", ""))
+                eid = str(event.get("id", ""))
+                m = self._best_market_from_event(event, predicted_temp, unit)
+                if not m:
                     m = self._event_as_market(event)
                 if m and m.active and not m.closed:
-                    best_score  = score
+                    best_score = score
                     best_market = m
 
         return best_market if best_score >= 10 else None
 
-    def _extract_best_market_from_event(self, event: dict) -> Optional[WeatherMarket]:
-        if not event: return None
-        eslug = str(event.get("slug",""))
-        eid   = str(event.get("id",""))
+    def _best_market_from_event(self, event: dict,
+                                 predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
+        """Vybere z event.markets[] ten jehož práh nejlépe odpovídá předpovědi."""
+        if not event:
+            return None
+        eslug = str(event.get("slug", ""))
+        eid = str(event.get("id", ""))
         markets_raw = event.get("markets") or []
-        # predicted_temp/unit musí být předány z kontextu — jako fallback bez nich
-        # použijeme _closest_to_prediction pokud jsou k dispozici, jinak první aktivní
-        m = self._closest_to_fair_fallback(markets_raw, eslug, eid)
-        if m:
-            return m
-        return self._event_as_market(event)
+        if not markets_raw:
+            return None
+        return self._closest_to_prediction(markets_raw, eslug, eid, predicted_temp, unit)
 
     def _event_as_market(self, event: dict) -> Optional[WeatherMarket]:
         try:
-            prices_raw   = event.get("outcomePrices","[]") or "[]"
-            outcomes_raw = event.get("outcomes","[]")       or "[]"
-            if isinstance(prices_raw,   str): prices_raw   = json.loads(prices_raw)
-            if isinstance(outcomes_raw, str): outcomes_raw = json.loads(outcomes_raw)
-            last_trade = float(event.get("lastTradePrice",0) or 0)
+            prices_raw = event.get("outcomePrices", "[]") or "[]"
+            outcomes_raw = event.get("outcomes", "[]") or "[]"
+            if isinstance(prices_raw, str):
+                prices_raw = json.loads(prices_raw)
+            if isinstance(outcomes_raw, str):
+                outcomes_raw = json.loads(outcomes_raw)
+            last_trade = float(event.get("lastTradePrice", 0) or 0)
             if last_trade == 0 and prices_raw:
                 last_trade = float(prices_raw[0])
             return WeatherMarket(
-                market_id=str(event.get("id","")),
-                event_id=str(event.get("id","")),
-                event_slug=str(event.get("slug","")),
-                market_slug=str(event.get("slug","")),
-                question=str(event.get("title", event.get("question",""))),
-                end_date=str(event.get("endDate","")),
+                market_id=str(event.get("id", "")),
+                event_id=str(event.get("id", "")),
+                event_slug=str(event.get("slug", "")),
+                market_slug=str(event.get("slug", "")),
+                question=str(event.get("title", event.get("question", ""))),
+                end_date=str(event.get("endDate", "")),
                 last_trade_price=last_trade,
-                best_ask=float(event.get("bestAsk",0) or 0),
-                best_bid=float(event.get("bestBid",0) or 0),
-                active=bool(event.get("active",True)),
-                closed=bool(event.get("closed",False)),
+                best_ask=float(event.get("bestAsk", 0) or 0),
+                best_bid=float(event.get("bestBid", 0) or 0),
+                active=bool(event.get("active", True)),
+                closed=bool(event.get("closed", False)),
             )
         except Exception as exc:
             logger.debug("_event_as_market: %s", exc)
             return None
 
-
-    def _closest_to_fair_fallback(self, markets_raw: list[dict], event_slug: str,
-                                   event_id: str) -> Optional[WeatherMarket]:
-        """Fallback bez znalosti predicted_temp: vezme první aktivní market."""
-        for m_raw in (markets_raw or []):
-            m = self._parse_market(m_raw, event_slug, event_id)
-            if m and m.active and not m.closed:
-                return m
-        return None
+    # ------------------------------------------------------------------
+    # Výběr marketu nejbližšího k předpovědi
+    # ------------------------------------------------------------------
 
     def _closest_to_prediction(self, markets_raw: list[dict], event_slug: str,
                                 event_id: str, predicted_temp: float,
                                 unit: str) -> Optional[WeatherMarket]:
         """
-        Vybere market jehož práh nejlépe odpovídá předpovědi.
+        Vybere market jehož teplotní práh nejlépe odpovídá předpovědi.
 
-        Logika výběru:
-          1. °C předpověď se VŽDY zaokrouhlí na celé číslo (15.7 → 16).
-          2. Hledá se exact match zaokrouhleného čísla.
-          3. Pokud exact match neexistuje, vybere nejbližší "X or below"
-             nebo "X or above" kontrakt (opět dle zaokrouhleného čísla).
-
-        Směr kontraktu:
-          - above/exceed/over  → YES = teplota NAD prahem
-          - below/under/orbelow → YES = teplota POD prahem
-
-        Odmítá kontrakt kde forecast je na špatné straně prahu
-        (např. forecast 16°C a market "15°C or below" → YES≈7% → přeskočit).
+        Logika:
+          1. °C vždy zaokrouhlíme na celé číslo (15.7 → 16)
+          2. Hledáme exact match zaokrouhleného čísla (priorita)
+          3. Pokud nenajdeme, vezmeme nejbližší X or below / X or above
+             kde forecast je na správné straně prahu
         """
-        import re
-
-        # Pro °C vždy zaokrouhli na celé číslo
-        # Standardní zaokrouhlení (ne banker's): 15.5→16, 16.5→17
+        # Pro °C zaokrouhlujeme standardně (ne banker's rounding)
         target = int(predicted_temp + 0.5) if unit.upper() == "C" else predicted_temp
-        logger.info("  Hledám práh: %.1f°%s → cíl=%g°%s",
-                    predicted_temp, unit, target, unit)
+        logger.info("  Hledám práh: %.1f°%s → cíl=%g°%s", predicted_temp, unit, target, unit)
 
-        ABOVE_KW = ["exceed", "above", "over", "higher", "more than", "greater"]
-        BELOW_KW = ["below", "under", "orbelow", "or-below", "or below",
-                    "less than", "lower", "at most", "atmost"]
-
-        def detect_direction(question: str, slug: str) -> str:
-            combined = (question + " " + slug).lower()
-            for kw in BELOW_KW:
-                if kw in combined:
-                    return "below"
-            for kw in ABOVE_KW:
-                if kw in combined:
-                    return "above"
-            return "unknown"
-
-        def extract_threshold(question: str, slug: str, unit: str) -> Optional[float]:
-            u = unit.upper()
-            patterns = [
-                rf"(\d+(?:\.\d+)?)[°\s]*{u}",       # "65°F", "12°C"
-                rf"(\d+(?:\.\d+)?){u.lower()}",        # "65f", "12c"
-                rf"exceed[\s-](\d+(?:\.\d+)?)",
-                rf"above[\s-](\d+(?:\.\d+)?)",
-                rf"below[\s-](\d+(?:\.\d+)?)",
-                rf"-(\d+(?:\.\d+)?)[cf](?:-|$|or)",   # "-15c-", "-15corbelow"
-                rf"-(\d+(?:\.\d+)?)-",                 # "-65-" fallback
-            ]
-            for text in [question, slug]:
-                for pat in patterns:
-                    m = re.search(pat, text, re.IGNORECASE)
-                    if m:
-                        return float(m.group(1))
-            return None
-
-        # Parsuj všechny aktivní markety
-        parsed: list[tuple[float, str, WeatherMarket]] = []  # (threshold, direction, market)
+        parsed: list[tuple[float, str, WeatherMarket]] = []
         for m_raw in (markets_raw or []):
             m = self._parse_market(m_raw, event_slug, event_id)
             if not m or not m.active or m.closed:
                 continue
-            direction = detect_direction(m.question, m.market_slug)
-            threshold = extract_threshold(m.question, m.market_slug, unit)
+            direction = self._detect_direction(m.question, m.market_slug)
+            threshold = self._extract_threshold(m.question, m.market_slug, unit)
             if threshold is None:
                 logger.debug("  Přeskočen (práh nenalezen): %s", m.market_slug)
                 continue
             parsed.append((threshold, direction, m))
-            logger.debug("  Parsován: %s | práh=%g | směr=%s",
-                         m.market_slug, threshold, direction)
+            logger.debug("  Parsován: %s | práh=%g | směr=%s", m.market_slug, threshold, direction)
 
         if not parsed:
             return None
 
-        # --- Krok 1: exact match zaokrouhleného čísla ---
+        # Krok 1: exact match
         exact = [(t, d, m) for t, d, m in parsed if t == target]
         if exact:
-            # Preferuj "above/exceed" u exact matche (přirozenější kontrakt)
-            above_exact = [(t,d,m) for t,d,m in exact if d in ("above","unknown")]
+            above_exact = [(t, d, m) for t, d, m in exact if d in ("above", "unknown")]
             chosen = above_exact[0] if above_exact else exact[0]
             logger.info("  ✓ Exact match: %s | práh=%g°%s | směr=%s",
                         chosen[2].market_slug, chosen[0], unit, chosen[1])
             return chosen[2]
 
-        # --- Krok 2: nejbližší smysluplný kontrakt --
+        # Krok 2: nejbližší smysluplný
+        candidates: list[tuple[float, WeatherMarket, str]] = []
+        for threshold, direction, m in parsed:
+            if direction == "below" and target > threshold:
+                logger.debug("  Skip (below, forecast %g > práh %g): %s", target, threshold, m.market_slug)
+                continue
+            if direction == "above" and target < threshold:
+                logger.debug("  Skip (above, forecast %g < práh %g): %s", target, threshold, m.market_slug)
+                continue
+            dist = abs(threshold - target)
+            candidates.append((dist, m, direction))
+
+        if not candidates:
+            logger.info("  Žádný smysluplný kandidát")
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+        best_dist, best, best_dir = candidates[0]
+        logger.info("  ✓ Nejbližší: %s | Δ=%g°%s | směr=%s", best.market_slug, best_dist, unit, best_dir)
+        return best
+
+    def _detect_direction(self, question: str, slug: str) -> str:
+        combined = (question + " " + slug).lower()
+        for kw in BELOW_KW:
+            if kw in combined:
+                return "below"
+        for kw in ABOVE_KW:
+            if kw in combined:
+                return "above"
+        return "unknown"
+
+    def _extract_threshold(self, question: str, slug: str, unit: str) -> Optional[float]:
+        u = unit.upper()
+        patterns = [
+            rf"(\d+(?:\.\d+)?)[°\s]*{u}",
+            rf"(\d+(?:\.\d+)?){u.lower()}",
+            rf"exceed[\s-](\d+(?:\.\d+)?)",
+            rf"above[\s-](\d+(?:\.\d+)?)",
+            rf"below[\s-](\d+(?:\.\d+)?)",
+            rf"-(\d+(?:\.\d+)?)[cf](?:-|$|or)",
+            rf"-(\d+(?:\.\d+)?)-",
+        ]
+        for text in [question, slug]:
+            for pat in patterns:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    return float(m.group(1))
+        return None
+
+    # ------------------------------------------------------------------
+    # Parsování raw market dict → WeatherMarket
+    # ------------------------------------------------------------------
+
+    def _parse_market(self, data: dict, event_slug: str = "",
+                      event_id: str = "") -> Optional[WeatherMarket]:
+        if not data or not isinstance(data, dict):
+            return None
+        try:
+            outcomes_raw = data.get("outcomes", "[]") or "[]"
+            prices_raw = data.get("outcomePrices", "[]") or "[]"
+            if isinstance(outcomes_raw, str):
+                outcomes_raw = json.loads(outcomes_raw)
+            if isinstance(prices_raw, str):
+                prices_raw = json.loads(prices_raw)
+
+            tokens = data.get("tokens", []) or []
+            clob_ids = data.get("clobTokenIds", []) or []
+            outcomes: list[MarketOutcome] = []
+            for i, name in enumerate(outcomes_raw):
+                price = float(prices_raw[i]) if i < len(prices_raw) else 0.5
+                token_id = ""
+                if i < len(tokens) and isinstance(tokens[i], dict):
+                    token_id = str(tokens[i].get("token_id", ""))
+                elif i < len(clob_ids):
+                    token_id = str(clob_ids[i])
+                outcomes.append(MarketOutcome(name=str(name), token_id=token_id, price=price))
+
+            last_trade = float(data.get("lastTradePrice", 0) or 0)
+            best_ask = float(data.get("bestAsk", 0) or 0)
+            best_bid = float(data.get("bestBid", 0) or 0)
+            if last_trade == 0 and prices_raw:
+                last_trade = float(prices_raw[0])
+
+            eid = event_id or str(data.get("eventId", ""))
+            eslug = event_slug or str(data.get("eventSlug", ""))
+
+            return WeatherMarket(
+                market_id=str(data.get("id", data.get("conditionId", ""))),
+                event_id=eid,
+                event_slug=eslug,
+                market_slug=str(data.get("slug", data.get("marketSlug", eslug))),
+                question=str(data.get("question", "")),
+                end_date=str(data.get("endDate", data.get("endDateIso", ""))),
+                last_trade_price=last_trade,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                active=bool(data.get("active", True)),
+                closed=bool(data.get("closed", False)),
+                outcomes=outcomes,
+            )
+        except Exception as exc:
+            logger.error("_parse_market: %s | %.200s", exc, str(data))
+            return None
+
+
+# ---------------------------------------------------------------------------
+# CLI test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    from datetime import timedelta
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    gamma = PolymarketGamma()
+    tomorrow = date.today() + timedelta(days=1)
+
+    print(f"\n=== Test Polymarket Gamma API === target: {tomorrow}\n")
+
+    tag_id = gamma.get_weather_tag_id()
+    print(f"Weather tag ID: {tag_id or 'nenalezen'}\n")
+
+    for city, temp, unit in [("new-york", 65.0, "F"), ("london", 12.0, "C"), ("madrid", 16.0, "C")]:
+        m = gamma.find_weather_market(city, tomorrow, temp, unit)
+        if m:
+            print(f"✓ {city}: {m.market_slug} | YES={m.yes_price_pct:.1f}%")
+        else:
+            print(f"✗ {city}: nenalezen")
