@@ -31,7 +31,7 @@ class CityConfig:
 
 CITIES: list[CityConfig] = [
     # USA — °F — NOAA
-    CityConfig("New York",  "US", 40.7128, -74.0060, "F", "NOAA",      "new-york"),
+    CityConfig("New York",  "US", 40.7128, -74.0060, "F", "NOAA",      "nyc"),
     CityConfig("Atlanta",   "US", 33.7490, -84.3880, "F", "NOAA",      "atlanta"),
     CityConfig("Chicago",   "US", 41.8781, -87.6298, "F", "NOAA",      "chicago"),
     CityConfig("Miami",     "US", 25.7617, -80.1918, "F", "NOAA",      "miami"),
@@ -276,3 +276,4 @@ if __name__ == "__main__":
                 print(f"  {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}  (zdroj: {fc.source})")
         except Exception as e:
             print(f"  {city_cfg.name:12s} → CHYBA: {e}")
+            
