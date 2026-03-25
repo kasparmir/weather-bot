@@ -150,12 +150,19 @@ def _process_forecast(
         }
 
     logger.info(
-        "  → Nalezen: %s | YES cena: %.1f%%",
-        market.market_slug, market.yes_price_pct
+        "  → Nalezen: %s | YES=%.4f NO=%.4f bestAsk=%.4f bestBid=%.4f lastTrade=%.4f",
+        market.market_slug,
+        market.yes_price,
+        1.0 - market.yes_price,
+        market.best_ask,
+        market.best_bid,
+        market.last_trade_price,
     )
 
-    # Kontrola: cena by měla být obchodovatelná (0.02–0.98)
-    entry_price = market.best_ask if market.best_ask > 0 else market.yes_price
+    # entry_price = outcomePrices[0] (YES cena) — bestAsk v Gamma API
+    # NENÍ cena YES tokenu, je to globální order book ask a nespolehlivý.
+    # yes_price pochází přímo z outcomePrices[] což je authoritative zdroj.
+    entry_price = market.yes_price
     if entry_price <= 0.02 or entry_price >= 0.98:
         reason = f"entry_price mimo rozsah: {entry_price:.4f}"
         logger.info("  → Přeskakuji: %s", reason)
@@ -254,4 +261,3 @@ if __name__ == "__main__":
 
     # Exit code
     sys.exit(0 if not result["errors"] else 1)
-      
