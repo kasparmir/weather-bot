@@ -388,6 +388,20 @@ class PolymarketGamma:
             if not m or not m.active or m.closed:
                 continue
             direction = self._detect_direction(m.question, m.market_slug)
+
+            # Range market (např. "50-51f"): přeskoč pokud forecast leží mimo [lo, hi]
+            rng = self._extract_range(m.market_slug, unit)
+            if rng is not None:
+                lo, hi = rng
+                if lo <= target <= hi:
+                    # Forecast přesně uvnitř range → perfektní match, Δ=0
+                    parsed.append((target, "range", m))
+                    logger.debug("  Parsován (range %g-%g, forecast IN): %s", lo, hi, m.market_slug)
+                else:
+                    logger.debug("  Přeskočen (range %g-%g, forecast %g OUT): %s",
+                                 lo, hi, target, m.market_slug)
+                continue  # range market zpracován, přejdi na další
+
             threshold = self._extract_threshold(m.question, m.market_slug, unit)
             if threshold is None:
                 logger.debug("  Přeskočen (práh nenalezen): %s", m.market_slug)
@@ -398,7 +412,14 @@ class PolymarketGamma:
         if not parsed:
             return None
 
-        # Krok 1: exact match
+        # Krok 1: range market (forecast uvnitř rozsahu) — absolutní priorita
+        range_matches = [(t, d, m) for t, d, m in parsed if d == "range"]
+        if range_matches:
+            best = range_matches[0][2]
+            logger.info("  ✓ Range match: %s", best.market_slug)
+            return best
+
+        # Krok 2: exact match zaokrouhleného čísla
         exact = [(t, d, m) for t, d, m in parsed if t == target]
         if exact:
             above_exact = [(t, d, m) for t, d, m in exact if d in ("above", "unknown")]
@@ -438,100 +459,14 @@ class PolymarketGamma:
                 return "above"
         return "unknown"
 
-    def _extract_threshold(self, question: str, slug: str, unit: str) -> Optional[float]:
-        u = unit.upper()
-        patterns = [
-            rf"(\d+(?:\.\d+)?)[°\s]*{u}",
-            rf"(\d+(?:\.\d+)?){u.lower()}",
-            rf"exceed[\s-](\d+(?:\.\d+)?)",
-            rf"above[\s-](\d+(?:\.\d+)?)",
-            rf"below[\s-](\d+(?:\.\d+)?)",
-            rf"-(\d+(?:\.\d+)?)[cf](?:-|$|or)",
-            rf"-(\d+(?:\.\d+)?)-",
-        ]
-        for text in [question, slug]:
-            for pat in patterns:
-                m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    return float(m.group(1))
-        return None
+    def _extract_range(self, slug: str, unit: str) -> Optional[tuple[float, float]]:
+        """
+        Detekuje range market slug jako '50-51f' nebo '10-11c'.
+        Vrací (lo, hi) nebo None.
 
-    # ------------------------------------------------------------------
-    # Parsování raw market dict → WeatherMarket
-    # ------------------------------------------------------------------
-
-    def _parse_market(self, data: dict, event_slug: str = "",
-                      event_id: str = "") -> Optional[WeatherMarket]:
-        if not data or not isinstance(data, dict):
-            return None
-        try:
-            outcomes_raw = data.get("outcomes", "[]") or "[]"
-            prices_raw = data.get("outcomePrices", "[]") or "[]"
-            if isinstance(outcomes_raw, str):
-                outcomes_raw = json.loads(outcomes_raw)
-            if isinstance(prices_raw, str):
-                prices_raw = json.loads(prices_raw)
-
-            tokens = data.get("tokens", []) or []
-            clob_ids = data.get("clobTokenIds", []) or []
-            outcomes: list[MarketOutcome] = []
-            for i, name in enumerate(outcomes_raw):
-                price = float(prices_raw[i]) if i < len(prices_raw) else 0.5
-                token_id = ""
-                if i < len(tokens) and isinstance(tokens[i], dict):
-                    token_id = str(tokens[i].get("token_id", ""))
-                elif i < len(clob_ids):
-                    token_id = str(clob_ids[i])
-                outcomes.append(MarketOutcome(name=str(name), token_id=token_id, price=price))
-
-            last_trade = float(data.get("lastTradePrice", 0) or 0)
-            best_ask = float(data.get("bestAsk", 0) or 0)
-            best_bid = float(data.get("bestBid", 0) or 0)
-            if last_trade == 0 and prices_raw:
-                last_trade = float(prices_raw[0])
-
-            eid = event_id or str(data.get("eventId", ""))
-            eslug = event_slug or str(data.get("eventSlug", ""))
-
-            return WeatherMarket(
-                market_id=str(data.get("id", data.get("conditionId", ""))),
-                event_id=eid,
-                event_slug=eslug,
-                market_slug=str(data.get("slug", data.get("marketSlug", eslug))),
-                question=str(data.get("question", "")),
-                end_date=str(data.get("endDate", data.get("endDateIso", ""))),
-                last_trade_price=last_trade,
-                best_ask=best_ask,
-                best_bid=best_bid,
-                active=bool(data.get("active", True)),
-                closed=bool(data.get("closed", False)),
-                outcomes=outcomes,
-            )
-        except Exception as exc:
-            logger.error("_parse_market: %s | %.200s", exc, str(data))
-            return None
-
-
-# ---------------------------------------------------------------------------
-# CLI test
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-    from datetime import timedelta
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-    gamma = PolymarketGamma()
-    tomorrow = date.today() + timedelta(days=1)
-
-    print(f"\n=== Test Polymarket Gamma API === target: {tomorrow}\n")
-
-    tag_id = gamma.get_weather_tag_id()
-    print(f"Weather tag ID: {tag_id or 'nenalezen'}\n")
-
-    for city, temp, unit in [("new-york", 65.0, "F"), ("london", 12.0, "C"), ("madrid", 16.0, "C")]:
-        m = gamma.find_weather_market(city, tomorrow, temp, unit)
-        if m:
-            print(f"✓ {city}: {m.market_slug} | YES={m.yes_price_pct:.1f}%")
-        else:
-            print(f"✗ {city}: nenalezen")
+        Omezení: max 3 cifry v každém čísle → nepřijme letopočet (2026).
+        Teploty jsou reálně v rozsahu -50..150°F / -40..60°C.
+        """
+        ul = unit.lower()
+        # \d{1,3} místo \d+ — zabrání zachycení roku jako čísla
+        m = re.s
