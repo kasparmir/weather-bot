@@ -55,6 +55,7 @@ TradeStatus = Literal[
     "OPEN",
     "CLOSED_PROFIT",
     "CLOSED_SETTLEMENT",
+    "CLOSED_STOP_LOSS",
     "CLOSED_MANUAL",
 ]
 

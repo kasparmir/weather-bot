@@ -44,6 +44,10 @@ logger = logging.getLogger("monitor")
 
 # Profit take threshold (lze přepsat env proměnnou)
 PROFIT_THRESHOLD = float(os.getenv("PROFIT_TAKE_THRESHOLD", "0.50"))
+# Stop-loss: prodej pokud ztráta přesáhne X % z entry (default 70 %)
+# Příklad: entry=0.40, stop_loss=0.70 → prodej pokud cena klesne pod 0.40*(1-0.70)=0.12
+# Nastavení: STOP_LOSS_THRESHOLD=0.50 (50%), 0=vypnuto
+STOP_LOSS_THRESHOLD = float(os.getenv("STOP_LOSS_THRESHOLD", "0.70"))
 # Minimální nárůst ceny pro zaznamenanou změnu (potlačení šumu)
 PRICE_CHANGE_LOG_MIN = float(os.getenv("PRICE_CHANGE_LOG_MIN", "0.005"))
 
@@ -68,6 +72,7 @@ def run_monitor() -> dict:
         "checked_at": now_iso,
         "open_positions": len(open_trades),
         "profit_takes": 0,
+        "stop_losses": 0,
         "price_updates": 0,
         "errors": [],
         "positions": [],
@@ -87,6 +92,8 @@ def run_monitor() -> dict:
 
         if pos_result["action"] == "PROFIT_TAKE":
             results["profit_takes"] += 1
+        elif pos_result["action"] == "STOP_LOSS":
+            results["stop_losses"] += 1
         elif pos_result["action"] == "PRICE_UPDATED":
             results["price_updates"] += 1
         elif pos_result["action"] == "ERROR":
@@ -168,12 +175,40 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
                 "pnl_pct": closed_trade.pnl_pct if closed_trade else 0,
             }
 
+        # Zkontroluj stop-loss podmínku
+        if STOP_LOSS_THRESHOLD > 0:
+            stop_price = trade.entry_price * (1.0 - STOP_LOSS_THRESHOLD)
+            if current_price <= stop_price:
+                loss_pct = (1.0 - current_price / trade.entry_price) * 100
+                logger.info(
+                    "  🛑 STOP-LOSS: %.4f <= %.4f (entry=%.4f -%.0f%%) | Prodávám",
+                    current_price, stop_price, trade.entry_price, loss_pct,
+                )
+                closed_trade = ledger.close_position(
+                    trade_id=trade.id,
+                    exit_price=current_price,
+                    reason="CLOSED_STOP_LOSS",
+                    notes=f"stop-loss: {current_price:.4f} <= {stop_price:.4f} (entry={trade.entry_price:.4f}, limit={STOP_LOSS_THRESHOLD:.0%})",
+                )
+                return {
+                    "trade_id": trade.id,
+                    "city": trade.city,
+                    "action": "STOP_LOSS",
+                    "entry_price": trade.entry_price,
+                    "exit_price": current_price,
+                    "stop_price": stop_price,
+                    "pnl": closed_trade.pnl if closed_trade else 0,
+                    "pnl_pct": closed_trade.pnl_pct if closed_trade else 0,
+                }
+
         # Jinak: aktualizuj cenu
         if price_change >= PRICE_CHANGE_LOG_MIN:
             logger.info(
-                "  📈 Cena: %.4f → %.4f (Δ%+.4f) | threshold=%.2f",
+                "  📈 Cena: %.4f → %.4f (Δ%+.4f) | profit=%.2f stop=%.4f",
                 trade.current_price, current_price,
-                current_price - trade.current_price, PROFIT_THRESHOLD,
+                current_price - trade.current_price,
+                PROFIT_THRESHOLD,
+                trade.entry_price * (1.0 - STOP_LOSS_THRESHOLD) if STOP_LOSS_THRESHOLD > 0 else 0,
             )
         else:
             logger.debug("  ↔ Cena beze změny: %.4f", current_price)
@@ -187,6 +222,7 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
             "prev_price": trade.current_price,
             "current_price": current_price,
             "distance_to_target": round(PROFIT_THRESHOLD - current_price, 4),
+            "stop_price": round(trade.entry_price * (1.0 - STOP_LOSS_THRESHOLD), 4) if STOP_LOSS_THRESHOLD > 0 else None,
         }
 
     except Exception as exc:
@@ -208,6 +244,7 @@ def _print_summary(results: dict) -> None:
     print("-"*50)
     print(f"   Otevřených pozic:  {results['open_positions']}")
     print(f"   Profit takes:      {results['profit_takes']}")
+    print(f"   Stop-losses:       {results.get('stop_losses', 0)}")
     print(f"   Aktualizací cen:   {results['price_updates']}")
     print(f"   Balance:           ${results['portfolio_balance']:.2f}")
 
@@ -217,6 +254,7 @@ def _print_summary(results: dict) -> None:
             action = pos["action"]
             icon = {
                 "PROFIT_TAKE":   "🎯",
+                "STOP_LOSS":     "🛑",
                 "SETTLEMENT":    "📋",
                 "PRICE_UPDATED": "📊",
                 "ERROR":         "❌",
@@ -225,6 +263,12 @@ def _print_summary(results: dict) -> None:
             if action == "PROFIT_TAKE":
                 print(
                     f"   {icon} {pos['city']:12s} PRODEJ @ {pos['exit_price']:.4f} "
+                    f"| P&L: ${pos.get('pnl', 0):+.2f} ({pos.get('pnl_pct', 0):+.1f}%)"
+                )
+            elif action == "STOP_LOSS":
+                print(
+                    f"   {icon} {pos['city']:12s} STOP-LOSS @ {pos['exit_price']:.4f} "
+                    f"(limit {pos.get('stop_price',0):.4f}) "
                     f"| P&L: ${pos.get('pnl', 0):+.2f} ({pos.get('pnl_pct', 0):+.1f}%)"
                 )
             elif action == "PRICE_UPDATED":
@@ -250,7 +294,7 @@ def _print_summary(results: dict) -> None:
     print("-"*50)
 
     # Tichý výstup pokud není co hlásit (pro OpenClaw HEARTBEAT_OK)
-    if results["open_positions"] == 0 and results["profit_takes"] == 0:
+    if results["open_positions"] == 0 and results["profit_takes"] == 0 and results.get("stop_losses", 0) == 0:
         print("HEARTBEAT_OK — žádné akce potřeba")
 
 
@@ -266,4 +310,3 @@ if __name__ == "__main__":
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     sys.exit(0 if not result["errors"] else 1)
-  
