@@ -469,4 +469,119 @@ class PolymarketGamma:
         """
         ul = unit.lower()
         # \d{1,3} místo \d+ — zabrání zachycení roku jako čísla
-        m = re.s
+        m = re.search(rf"-(\d{{1,3}}(?:\.\d+)?)-(\d{{1,3}}(?:\.\d+)?){ul}(?:-|$|or)",
+                      slug, re.IGNORECASE)
+        if m:
+            lo, hi = float(m.group(1)), float(m.group(2))
+            # Základní sanity check: lo < hi a hodnoty dávají smysl
+            if lo < hi and lo >= -50 and hi <= 150:
+                return lo, hi
+        return None
+
+    def _extract_threshold(self, question: str, slug: str, unit: str) -> Optional[float]:
+        """
+        Extrahuje teplotní práh.
+        Pro range markety ('50-51f') vrátí střed rozsahu.
+        """
+        # Range market má přednost — musí být detekován dřív než single patterns
+        # aby "-50-51f" nevyprodukovalo 50 z posledního pattern "-(\d+)-"
+        rng = self._extract_range(slug, unit)
+        if rng is not None:
+            return (rng[0] + rng[1]) / 2  # střed rozsahu pro Δ výpočet
+
+        u = unit.upper()
+        patterns = [
+            rf"(\d+(?:\.\d+)?)[°\s]*{u}",
+            rf"(\d+(?:\.\d+)?){u.lower()}",
+            rf"exceed[\s-](\d+(?:\.\d+)?)",
+            rf"above[\s-](\d+(?:\.\d+)?)",
+            rf"below[\s-](\d+(?:\.\d+)?)",
+            rf"-(\d+(?:\.\d+)?)[cf](?:-|$|or)",
+            rf"-(\d+(?:\.\d+)?)-",
+        ]
+        for text in [question, slug]:
+            for pat in patterns:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    return float(m.group(1))
+        return None
+
+    # ------------------------------------------------------------------
+    # Parsování raw market dict → WeatherMarket
+    # ------------------------------------------------------------------
+
+    def _parse_market(self, data: dict, event_slug: str = "",
+                      event_id: str = "") -> Optional[WeatherMarket]:
+        if not data or not isinstance(data, dict):
+            return None
+        try:
+            outcomes_raw = data.get("outcomes", "[]") or "[]"
+            prices_raw = data.get("outcomePrices", "[]") or "[]"
+            if isinstance(outcomes_raw, str):
+                outcomes_raw = json.loads(outcomes_raw)
+            if isinstance(prices_raw, str):
+                prices_raw = json.loads(prices_raw)
+
+            tokens = data.get("tokens", []) or []
+            clob_ids = data.get("clobTokenIds", []) or []
+            outcomes: list[MarketOutcome] = []
+            for i, name in enumerate(outcomes_raw):
+                price = float(prices_raw[i]) if i < len(prices_raw) else 0.5
+                token_id = ""
+                if i < len(tokens) and isinstance(tokens[i], dict):
+                    token_id = str(tokens[i].get("token_id", ""))
+                elif i < len(clob_ids):
+                    token_id = str(clob_ids[i])
+                outcomes.append(MarketOutcome(name=str(name), token_id=token_id, price=price))
+
+            last_trade = float(data.get("lastTradePrice", 0) or 0)
+            best_ask = float(data.get("bestAsk", 0) or 0)
+            best_bid = float(data.get("bestBid", 0) or 0)
+            if last_trade == 0 and prices_raw:
+                last_trade = float(prices_raw[0])
+
+            eid = event_id or str(data.get("eventId", ""))
+            eslug = event_slug or str(data.get("eventSlug", ""))
+
+            return WeatherMarket(
+                market_id=str(data.get("id", data.get("conditionId", ""))),
+                event_id=eid,
+                event_slug=eslug,
+                market_slug=str(data.get("slug", data.get("marketSlug", eslug))),
+                question=str(data.get("question", "")),
+                end_date=str(data.get("endDate", data.get("endDateIso", ""))),
+                last_trade_price=last_trade,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                active=bool(data.get("active", True)),
+                closed=bool(data.get("closed", False)),
+                outcomes=outcomes,
+            )
+        except Exception as exc:
+            logger.error("_parse_market: %s | %.200s", exc, str(data))
+            return None
+
+
+# ---------------------------------------------------------------------------
+# CLI test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    from datetime import timedelta
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    gamma = PolymarketGamma()
+    tomorrow = date.today() + timedelta(days=1)
+
+    print(f"\n=== Test Polymarket Gamma API === target: {tomorrow}\n")
+
+    tag_id = gamma.get_weather_tag_id()
+    print(f"Weather tag ID: {tag_id or 'nenalezen'}\n")
+
+    for city, temp, unit in [("new-york", 65.0, "F"), ("london", 12.0, "C"), ("madrid", 16.0, "C")]:
+        m = gamma.find_weather_market(city, tomorrow, temp, unit)
+        if m:
+            print(f"✓ {city}: {m.market_slug} | YES={m.yes_price_pct:.1f}%")
+        else:
+            print(f"✗ {city}: nenalezen")
