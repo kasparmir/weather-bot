@@ -131,13 +131,22 @@ class WeatherCollector:
 
     def _fetch_noaa(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
         """
-        NOAA API:
-          1. GET /points/{lat},{lon}         → forecastHourly URL
-          2. GET forecastHourly              → hodinové předpovědi
-          Extrahujeme maximální teplotu pro `target_date` z hodinových dat.
+        NOAA API — dvoustupňová strategie:
+
+        Strategie A (primární): /forecast — 12h periody (isDaytime=True/False)
+          Daytime perioda přímo obsahuje "High: 54°F" = to co ukazuje NOAA web
+          a co Polymarket používá jako referenci.
+
+        Strategie B (fallback): /forecast/hourly — hodinové periody
+          Filtrujeme POUZE hodiny 6:00–18:00 lokálního času (daytime high),
+          aby nedošlo k zahrnutí nočního tepla předchozího dne.
+
+        Klíčový poznatek: brát max ze všech 24 hodin je chyba — noční hodiny
+        00:00–05:00 bývají teplotně stále součástí předchozího dne.
+        NOAA web i Polymarket definují "high" jako maximum přes denní hodiny.
         """
         with httpx.Client(timeout=self.timeout) as client:
-            # Krok 1: Získání grid metadat (s cache)
+            # Krok 1: grid metadata (s cache)
             grid_key = f"{city.lat},{city.lon}"
             if grid_key not in self._noaa_grid_cache:
                 url = f"{self.NOAA_BASE}/points/{city.lat:.4f},{city.lon:.4f}"
@@ -146,44 +155,84 @@ class WeatherCollector:
                 self._noaa_grid_cache[grid_key] = resp.json()["properties"]
 
             props = self._noaa_grid_cache[grid_key]
-            forecast_hourly_url: str = props["forecastHourly"]
 
-            # Krok 2: Stažení hodinových předpovědí
-            resp = client.get(forecast_hourly_url, headers={"User-Agent": "PolymarketWeatherBot/1.0"})
+            # Strategie A: /forecast (12h periody s isDaytime)
+            try:
+                resp = client.get(
+                    props["forecast"],
+                    headers={"User-Agent": "PolymarketWeatherBot/1.0"},
+                )
+                resp.raise_for_status()
+                periods_12h: list[dict] = resp.json()["properties"]["periods"]
+                high_f = self._daytime_high_from_12h(periods_12h, target_date)
+                if high_f is not None:
+                    logger.info("NOAA [12h] %s: high=%.0f°F (daytime)", city.name, high_f)
+                    return WeatherForecast(
+                        city=city.name, target_date=target_date,
+                        predicted_high=float(int(high_f + 0.5)),
+                        unit="F", source="NOAA",
+                        raw_celsius=_f_to_c(high_f),
+                        fetched_at=datetime.now(timezone.utc),
+                    )
+            except Exception as exc:
+                logger.warning("NOAA [12h] %s: fallback na hourly (%s)", city.name, exc)
+
+            # Strategie B: /forecast/hourly — pouze hodiny 6–18 lokálního času
+            resp = client.get(
+                props["forecastHourly"],
+                headers={"User-Agent": "PolymarketWeatherBot/1.0"},
+            )
             resp.raise_for_status()
-            periods: list[dict] = resp.json()["properties"]["periods"]
+            periods_1h: list[dict] = resp.json()["properties"]["periods"]
 
-        # Filtrujeme na target_date a hledáme maximum
-        temps_f: list[float] = []
-        for period in periods:
-            start = datetime.fromisoformat(period["startTime"].replace("Z", "+00:00"))
-            if start.date() == target_date:
-                t = float(period["temperature"])
-                unit = period.get("temperatureUnit", "F")
-                if unit == "C":
-                    t = _c_to_f(t)
-                temps_f.append(t)
-
-        if not temps_f:
+        high_f = self._daytime_high_from_hourly(periods_1h, target_date)
+        if high_f is None:
             logger.warning("NOAA: žádná data pro %s dne %s", city.name, target_date)
             return None
 
-        high_f = max(temps_f)
-        high_c = _f_to_c(high_f)
-
-        # Polymarket weather kontrakty pro USA používají celá čísla °F
-        # zaokrouhlujeme na nejbližší celé číslo
-        high_f_rounded = round(high_f)
-
+        logger.info("NOAA [hourly] %s: high=%.0f°F (6–18 lokálně)", city.name, high_f)
         return WeatherForecast(
-            city=city.name,
-            target_date=target_date,
-            predicted_high=float(high_f_rounded),
-            unit="F",
-            source="NOAA",
-            raw_celsius=high_c,
+            city=city.name, target_date=target_date,
+            predicted_high=float(int(high_f + 0.5)),
+            unit="F", source="NOAA",
+            raw_celsius=_f_to_c(high_f),
             fetched_at=datetime.now(timezone.utc),
         )
+
+    def _daytime_high_from_12h(self, periods: list[dict], target_date: date) -> Optional[float]:
+        """
+        Z 12h NOAA period vybere daytime periodu pro target_date.
+        Perioda s isDaytime=True obsahuje denní maximum přímo.
+        """
+        for p in periods:
+            if not p.get("isDaytime", False):
+                continue
+            start = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))
+            if start.date() == target_date:
+                t = float(p["temperature"])
+                if p.get("temperatureUnit", "F") == "C":
+                    t = _c_to_f(t)
+                return t
+        return None
+
+    def _daytime_high_from_hourly(self, periods: list[dict], target_date: date) -> Optional[float]:
+        """
+        Z hodinových period vybere maximum v 6:00–18:00 lokálního času.
+        Ignoruje noční hodiny (0–5, 19–23) které patří teplotně jinému dni.
+        """
+        temps: list[float] = []
+        for p in periods:
+            start = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))
+            if start.date() != target_date:
+                continue
+            local_hour = start.hour  # .hour zachovává lokální offset z ISO stringu
+            if not (6 <= local_hour <= 18):
+                continue
+            t = float(p["temperature"])
+            if p.get("temperatureUnit", "F") == "C":
+                t = _c_to_f(t)
+            temps.append(t)
+        return max(temps) if temps else None
 
     # ------------------------------------------------------------------
     # Meteoblue (EU)
@@ -276,4 +325,3 @@ if __name__ == "__main__":
                 print(f"  {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}  (zdroj: {fc.source})")
         except Exception as e:
             print(f"  {city_cfg.name:12s} → CHYBA: {e}")
-            
