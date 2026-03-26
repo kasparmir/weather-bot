@@ -195,8 +195,8 @@ class WeatherCollector:
 
     def _fetch_noaa(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
         """
-        Používá /forecast endpoint (12h periody).
-        isDaytime=True perioda = přesný daily high, shodný s NOAA webem.
+        Používá /forecast/hourly endpoint.
+        Bere maximum ze všech hodinových hodnot pro daný den (lokální čas).
         """
         with httpx.Client(timeout=self.timeout) as client:
             grid_key = f"{city.lat},{city.lon}"
@@ -207,17 +207,27 @@ class WeatherCollector:
                 self._noaa_grid_cache[grid_key] = resp.json()["properties"]
 
             props = self._noaa_grid_cache[grid_key]
-            resp = client.get(props["forecast"],
+            resp = client.get(props["forecastHourly"],
                               headers={"User-Agent": "PolymarketWeatherBot/1.0"})
             resp.raise_for_status()
             periods: list[dict] = resp.json()["properties"]["periods"]
 
-        high_f = self._noaa_daytime_high(periods, target_date)
-        if high_f is None:
-            logger.warning("NOAA: daytime perioda nenalezena pro %s %s", city.name, target_date)
+        temps: list[float] = []
+        for p in periods:
+            start = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))
+            if start.date() != target_date:
+                continue
+            t = float(p["temperature"])
+            if p.get("temperatureUnit", "F") == "C":
+                t = _c_to_f(t)
+            temps.append(t)
+
+        if not temps:
+            logger.warning("NOAA: žádná data pro %s %s", city.name, target_date)
             return None
 
-        logger.info("NOAA %s: high=%d°F", city.name, int(high_f + 0.5))
+        high_f = max(temps)
+        logger.info("NOAA %s: high=%d°F (max z %d hodin)", city.name, int(high_f + 0.5), len(temps))
         return WeatherForecast(
             city=city.name, target_date=target_date,
             predicted_high=float(int(high_f + 0.5)),
@@ -225,19 +235,6 @@ class WeatherCollector:
             raw_celsius=_f_to_c(high_f),
             fetched_at=datetime.now(timezone.utc),
         )
-
-    def _noaa_daytime_high(self, periods: list[dict], target_date: date) -> Optional[float]:
-        """isDaytime=True perioda pro target_date = přímo daily high."""
-        for p in periods:
-            if not p.get("isDaytime", False):
-                continue
-            start = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))
-            if start.date() == target_date:
-                t = float(p["temperature"])
-                if p.get("temperatureUnit", "F") == "C":
-                    t = _c_to_f(t)
-                return t
-        return None
 
     # ------------------------------------------------------------------
     # Weather Underground (scraper)
