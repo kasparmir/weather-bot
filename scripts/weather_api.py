@@ -1,19 +1,36 @@
 """
 weather_api.py — WeatherCollector
-Sbírá reálná data předpovědí z NOAA (USA) a Meteoblue (EU).
+==================================
+Providery:
+  NOAA          — USA, zdarma, bez API klíče
+  WUNDERGROUND  — USA, scraper (bez API klíče)
+  METEOBLUE     — EU, API klíč (METEOBLUE_API_KEY)
+
+Konfigurace providerů — env proměnné:
+  USA_WEATHER_PROVIDER=noaa                    # default pro všechna US města
+  USA_WEATHER_PROVIDER=wunderground            # přepne všechna US města na WU
+  USA_WEATHER_PROVIDER=noaa,wunderground       # NOAA primárně, WU jako fallback
+
+Per-město (přepíše globální nastavení):
+  WEATHER_PROVIDER_NEW_YORK=wunderground
+  WEATHER_PROVIDER_DALLAS=noaa,wunderground
+  (název města UPPERCASE, mezery → _)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Konfigurace měst
@@ -25,26 +42,50 @@ class CityConfig:
     country: str
     lat: float
     lon: float
-    unit: str          # "F" nebo "C"
-    api_source: str    # "NOAA" nebo "METEOBLUE"
-    polymarket_name: str  # Název pro hledání v Polymarketu
+    unit: str
+    api_source: str         # default provider
+    polymarket_name: str
+    wu_slug: str = ""       # Weather Underground URL slug, např. "us/ny/new-york-city"
+
 
 CITIES: list[CityConfig] = [
-    # USA — °F — NOAA
-    CityConfig("New York",  "US", 40.7128, -74.0060, "F", "NOAA",      "nyc"),
-    CityConfig("Atlanta",   "US", 33.7490, -84.3880, "F", "NOAA",      "atlanta"),
-    CityConfig("Chicago",   "US", 41.8781, -87.6298, "F", "NOAA",      "chicago"),
-    CityConfig("Miami",     "US", 25.7617, -80.1918, "F", "NOAA",      "miami"),
-    CityConfig("Seattle",   "US", 47.6062, -122.3321,"F", "NOAA",      "seattle"),
-    CityConfig("Dallas",    "US", 32.7767, -96.7970, "F", "NOAA",      "dallas"),
-    # EU — °C — Meteoblue
-    CityConfig("London",    "UK", 51.5074,  -0.1278, "C", "METEOBLUE", "london"),
-    CityConfig("Paris",     "FR", 48.8566,   2.3522, "C", "METEOBLUE", "paris"),
-    CityConfig("Madrid",    "ES", 40.4168,  -3.7038, "C", "METEOBLUE", "madrid"),
-    CityConfig("Warsaw",    "PL", 52.2297,  21.0122, "C", "METEOBLUE", "warsaw"),
+    CityConfig("New York", "US", 40.7128, -74.0060, "F", "NOAA", "nyc",
+               wu_slug="us/ny/new-york-city"),
+    CityConfig("Atlanta",  "US", 33.7490, -84.3880, "F", "NOAA", "atlanta",
+               wu_slug="us/ga/atlanta"),
+    CityConfig("Chicago",  "US", 41.8781, -87.6298, "F", "NOAA", "chicago",
+               wu_slug="us/il/chicago"),
+    CityConfig("Miami",    "US", 25.7617, -80.1918, "F", "NOAA", "miami",
+               wu_slug="us/fl/miami"),
+    CityConfig("Seattle",  "US", 47.6062, -122.3321, "F", "NOAA", "seattle",
+               wu_slug="us/wa/seattle"),
+    CityConfig("Dallas",   "US", 32.7767, -96.7970, "F", "NOAA", "dallas",
+               wu_slug="us/tx/dallas"),
+    CityConfig("London",   "UK", 51.5074,  -0.1278, "C", "METEOBLUE", "london"),
+    CityConfig("Paris",    "FR", 48.8566,   2.3522, "C", "METEOBLUE", "paris"),
+    CityConfig("Madrid",   "ES", 40.4168,  -3.7038, "C", "METEOBLUE", "madrid"),
+    CityConfig("Warsaw",   "PL", 52.2297,  21.0122, "C", "METEOBLUE", "warsaw"),
 ]
 
 CITY_MAP: dict[str, CityConfig] = {c.name: c for c in CITIES}
+
+
+def _resolve_provider(city: CityConfig) -> list[str]:
+    """
+    Vrátí seřazený seznam providerů pro město.
+    Priorita: per-město env > globální USA env > default z CityConfig.
+    """
+    env_key = "WEATHER_PROVIDER_" + city.name.upper().replace(" ", "_")
+    per_city = os.getenv(env_key, "").strip().lower()
+    if per_city:
+        return [p.strip() for p in per_city.split(",") if p.strip()]
+
+    if city.country == "US":
+        global_usa = os.getenv("USA_WEATHER_PROVIDER", "").strip().lower()
+        if global_usa:
+            return [p.strip() for p in global_usa.split(",") if p.strip()]
+
+    return [city.api_source.lower()]
 
 
 # ---------------------------------------------------------------------------
@@ -54,12 +95,12 @@ CITY_MAP: dict[str, CityConfig] = {c.name: c for c in CITIES}
 @dataclass
 class WeatherForecast:
     city: str
-    target_date: date      # datum, pro které předpovídáme
-    predicted_high: float  # max. teplota ve správných jednotkách
-    unit: str              # "F" nebo "C"
-    source: str            # "NOAA" nebo "METEOBLUE"
-    raw_celsius: float     # vždy v °C pro interní porovnání
-    fetched_at: datetime   # UTC timestamp získání dat
+    target_date: date
+    predicted_high: float
+    unit: str
+    source: str
+    raw_celsius: float
+    fetched_at: datetime
 
     def to_dict(self) -> dict:
         return {
@@ -74,19 +115,29 @@ class WeatherForecast:
 
 
 # ---------------------------------------------------------------------------
-# Hlavní třída
+# WeatherCollector
 # ---------------------------------------------------------------------------
 
 class WeatherCollector:
-    """
-    Sbírá předpovědi počasí z NOAA a Meteoblue.
-    Vrací maximální teploty ve správných jednotkách pro Polymarket kontrakty.
-    """
 
-    NOAA_BASE = "https://api.weather.gov"
+    NOAA_BASE      = "https://api.weather.gov"
     METEOBLUE_BASE = "https://my.meteoblue.com/packages/basic-day"
+    WU_BASE        = "https://www.wunderground.com/forecast"
 
-    def __init__(self, meteoblue_api_key: str | None = None, timeout: int = 15):
+    # Browser-like headers pro WU scraping
+    _WU_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+    }
+
+    def __init__(self, meteoblue_api_key: str | None = None, timeout: int = 20):
         self.meteoblue_api_key = meteoblue_api_key or os.getenv("METEOBLUE_API_KEY", "")
         self.timeout = timeout
         self._noaa_grid_cache: dict[str, dict] = {}
@@ -96,57 +147,58 @@ class WeatherCollector:
     # ------------------------------------------------------------------
 
     def get_all_forecasts(self, target_date: date) -> list[WeatherForecast]:
-        """
-        Získá předpovědi pro všechna nakonfigurovaná města.
-        Tiché selhání pro jednotlivá města (loguje chybu).
-        """
         results: list[WeatherForecast] = []
         for city in CITIES:
             try:
-                forecast = self.get_forecast(city.name, target_date)
-                if forecast:
-                    results.append(forecast)
+                fc = self.get_forecast(city.name, target_date)
+                if fc:
+                    results.append(fc)
             except Exception as exc:
                 logger.error("Chyba předpovědi pro %s: %s", city.name, exc)
         return results
 
     def get_forecast(self, city_name: str, target_date: date) -> Optional[WeatherForecast]:
-        """
-        Vrátí předpověď pro konkrétní město a datum.
-        """
         city = CITY_MAP.get(city_name)
         if not city:
             raise ValueError(f"Neznámé město: {city_name!r}. Dostupná: {list(CITY_MAP)}")
 
-        if city.api_source == "NOAA":
+        providers = _resolve_provider(city)
+        last_exc: Optional[Exception] = None
+
+        for provider in providers:
+            try:
+                fc = self._fetch_by_provider(provider, city, target_date)
+                if fc:
+                    return fc
+                logger.warning("%s [%s]: žádná data", city.name, provider.upper())
+            except Exception as exc:
+                logger.warning("%s [%s]: %s", city.name, provider.upper(), exc)
+                last_exc = exc
+
+        if last_exc:
+            raise last_exc
+        return None
+
+    def _fetch_by_provider(self, provider: str, city: CityConfig,
+                           target_date: date) -> Optional[WeatherForecast]:
+        if provider == "noaa":
             return self._fetch_noaa(city, target_date)
-        elif city.api_source == "METEOBLUE":
+        elif provider == "wunderground":
+            return self._fetch_wunderground(city, target_date)
+        elif provider == "meteoblue":
             return self._fetch_meteoblue(city, target_date)
-        else:
-            raise ValueError(f"Neznámý zdroj: {city.api_source!r}")
+        raise ValueError(f"Neznámý provider: {provider!r}")
 
     # ------------------------------------------------------------------
-    # NOAA (USA)
+    # NOAA
     # ------------------------------------------------------------------
 
     def _fetch_noaa(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
         """
-        NOAA API — dvoustupňová strategie:
-
-        Strategie A (primární): /forecast — 12h periody (isDaytime=True/False)
-          Daytime perioda přímo obsahuje "High: 54°F" = to co ukazuje NOAA web
-          a co Polymarket používá jako referenci.
-
-        Strategie B (fallback): /forecast/hourly — hodinové periody
-          Filtrujeme POUZE hodiny 6:00–18:00 lokálního času (daytime high),
-          aby nedošlo k zahrnutí nočního tepla předchozího dne.
-
-        Klíčový poznatek: brát max ze všech 24 hodin je chyba — noční hodiny
-        00:00–05:00 bývají teplotně stále součástí předchozího dne.
-        NOAA web i Polymarket definují "high" jako maximum přes denní hodiny.
+        Používá /forecast endpoint (12h periody).
+        isDaytime=True perioda = přesný daily high, shodný s NOAA webem.
         """
         with httpx.Client(timeout=self.timeout) as client:
-            # Krok 1: grid metadata (s cache)
             grid_key = f"{city.lat},{city.lon}"
             if grid_key not in self._noaa_grid_cache:
                 url = f"{self.NOAA_BASE}/points/{city.lat:.4f},{city.lon:.4f}"
@@ -155,42 +207,17 @@ class WeatherCollector:
                 self._noaa_grid_cache[grid_key] = resp.json()["properties"]
 
             props = self._noaa_grid_cache[grid_key]
-
-            # Strategie A: /forecast (12h periody s isDaytime)
-            try:
-                resp = client.get(
-                    props["forecast"],
-                    headers={"User-Agent": "PolymarketWeatherBot/1.0"},
-                )
-                resp.raise_for_status()
-                periods_12h: list[dict] = resp.json()["properties"]["periods"]
-                high_f = self._daytime_high_from_12h(periods_12h, target_date)
-                if high_f is not None:
-                    logger.info("NOAA [12h] %s: high=%.0f°F (daytime)", city.name, high_f)
-                    return WeatherForecast(
-                        city=city.name, target_date=target_date,
-                        predicted_high=float(int(high_f + 0.5)),
-                        unit="F", source="NOAA",
-                        raw_celsius=_f_to_c(high_f),
-                        fetched_at=datetime.now(timezone.utc),
-                    )
-            except Exception as exc:
-                logger.warning("NOAA [12h] %s: fallback na hourly (%s)", city.name, exc)
-
-            # Strategie B: /forecast/hourly — pouze hodiny 6–18 lokálního času
-            resp = client.get(
-                props["forecastHourly"],
-                headers={"User-Agent": "PolymarketWeatherBot/1.0"},
-            )
+            resp = client.get(props["forecast"],
+                              headers={"User-Agent": "PolymarketWeatherBot/1.0"})
             resp.raise_for_status()
-            periods_1h: list[dict] = resp.json()["properties"]["periods"]
+            periods: list[dict] = resp.json()["properties"]["periods"]
 
-        high_f = self._daytime_high_from_hourly(periods_1h, target_date)
+        high_f = self._noaa_daytime_high(periods, target_date)
         if high_f is None:
-            logger.warning("NOAA: žádná data pro %s dne %s", city.name, target_date)
+            logger.warning("NOAA: daytime perioda nenalezena pro %s %s", city.name, target_date)
             return None
 
-        logger.info("NOAA [hourly] %s: high=%.0f°F (6–18 lokálně)", city.name, high_f)
+        logger.info("NOAA %s: high=%d°F", city.name, int(high_f + 0.5))
         return WeatherForecast(
             city=city.name, target_date=target_date,
             predicted_high=float(int(high_f + 0.5)),
@@ -199,11 +226,8 @@ class WeatherCollector:
             fetched_at=datetime.now(timezone.utc),
         )
 
-    def _daytime_high_from_12h(self, periods: list[dict], target_date: date) -> Optional[float]:
-        """
-        Z 12h NOAA period vybere daytime periodu pro target_date.
-        Perioda s isDaytime=True obsahuje denní maximum přímo.
-        """
+    def _noaa_daytime_high(self, periods: list[dict], target_date: date) -> Optional[float]:
+        """isDaytime=True perioda pro target_date = přímo daily high."""
         for p in periods:
             if not p.get("isDaytime", False):
                 continue
@@ -215,74 +239,183 @@ class WeatherCollector:
                 return t
         return None
 
-    def _daytime_high_from_hourly(self, periods: list[dict], target_date: date) -> Optional[float]:
+    # ------------------------------------------------------------------
+    # Weather Underground (scraper)
+    # ------------------------------------------------------------------
+
+    def _fetch_wunderground(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
         """
-        Z hodinových period vybere maximum v 6:00–18:00 lokálního času.
-        Ignoruje noční hodiny (0–5, 19–23) které patří teplotně jinému dni.
+        Scraper pro wunderground.com/forecast/{wu_slug}.
+        Extrahuje __NEXT_DATA__ JSON vložený do stránky.
         """
-        temps: list[float] = []
-        for p in periods:
-            start = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))
-            if start.date() != target_date:
+        if not city.wu_slug:
+            raise ValueError(f"wu_slug není nastaven pro {city.name}")
+
+        url = f"{self.WU_BASE}/{city.wu_slug}"
+        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+            resp = client.get(url, headers=self._WU_HEADERS)
+            resp.raise_for_status()
+            html = resp.text
+
+        data = self._wu_extract_next_data(html)
+        if not data:
+            raise RuntimeError(f"WU __NEXT_DATA__ nenalezen ({url})")
+
+        high_f = self._wu_parse_daily_high(data, target_date)
+        if high_f is None:
+            raise RuntimeError(f"WU: high pro {target_date} nenalezen ({city.name})")
+
+        logger.info("WU %s: high=%d°F", city.name, int(high_f + 0.5))
+        return WeatherForecast(
+            city=city.name, target_date=target_date,
+            predicted_high=float(int(high_f + 0.5)),
+            unit="F", source="WUNDERGROUND",
+            raw_celsius=_f_to_c(high_f),
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+    def _wu_extract_next_data(self, html: str) -> Optional[dict]:
+        """Extrahuje JSON z <script id="__NEXT_DATA__">."""
+        m = re.search(
+            r'<script\s+id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.*?\})\s*</script>',
+            html, re.DOTALL,
+        )
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError as exc:
+            logger.error("WU JSON parse: %s", exc)
+            return None
+
+    def _wu_parse_daily_high(self, data: dict, target_date: date) -> Optional[float]:
+        """
+        Extrahuje denní maximum z __NEXT_DATA__.
+        Zkouší 4 varianty struktury (WU schéma se mění).
+
+        Struktura Varianta A (nejčastější):
+          data.props.pageProps.forecastData.temperatureMax[i]
+          data.props.pageProps.forecastData.validTimeLocal[i]
+
+        Varianta B (daypart):
+          data.props.pageProps.forecast.daypart[0].temperature[i]
+          data.props.pageProps.forecast.validTimeLocal[i]
+
+        Varianta C (SunV3 / novější):
+          data.props.pageProps.{anyKey}.calendarDayTemperatureMax[i]
+          data.props.pageProps.{anyKey}.validTimeLocal[i]
+
+        Varianta D: regex fallback
+        """
+        target_str = target_date.isoformat()
+
+        # Pomocná funkce: projde páry (čas, teplota) a najde shodu
+        def match_day(times: list, temps: list) -> Optional[float]:
+            for t_str, temp in zip(times, temps):
+                if temp is None:
+                    continue
+                day = str(t_str)[:10]
+                if day == target_str:
+                    return float(temp)
+            return None
+
+        pp = data.get("props", {}).get("pageProps", {})
+
+        # --- Varianta A ---
+        try:
+            fd = pp["forecastData"]
+            times = fd.get("validTimeLocal") or fd.get("validTime") or []
+            temps = fd.get("temperatureMax") or fd.get("temperature") or []
+            result = match_day(times, temps)
+            if result is not None:
+                return result
+        except (KeyError, TypeError):
+            pass
+
+        # --- Varianta B ---
+        # validTimeLocal má 1 položku na den (3 nebo 7 dní).
+        # daypart[0].temperature má 2 položky na den: [den0, noc0, den1, noc1, ...]
+        # Denní high je na indexu i*2, noční na i*2+1.
+        try:
+            fc = pp["forecast"]
+            times = fc.get("validTimeLocal") or []
+            dp = fc["daypart"][0]
+            temps = dp.get("temperature") or []
+            for i, t_str in enumerate(times):
+                day = str(t_str)[:10] if t_str else ""
+                if day == target_str:
+                    day_idx = i * 2  # denní index
+                    if day_idx < len(temps) and temps[day_idx] is not None:
+                        return float(temps[day_idx])
+        except (KeyError, TypeError, IndexError):
+            pass
+
+        # --- Varianta C: hledej v jakémkoliv klíči pageProps ---
+        for key, obj in pp.items():
+            if not isinstance(obj, dict):
                 continue
-            local_hour = start.hour  # .hour zachovává lokální offset z ISO stringu
-            if not (6 <= local_hour <= 18):
+            times = obj.get("validTimeLocal") or obj.get("validTimeUtc") or []
+            temps = (obj.get("calendarDayTemperatureMax")
+                     or obj.get("temperatureMax")
+                     or obj.get("temperature") or [])
+            if not times or not temps:
                 continue
-            t = float(p["temperature"])
-            if p.get("temperatureUnit", "F") == "C":
-                t = _c_to_f(t)
-            temps.append(t)
-        return max(temps) if temps else None
+            result = match_day(times, temps)
+            if result is not None:
+                logger.debug("WU varianta C (key=%s): %.0f°F", key, result)
+                return result
+
+        # --- Varianta D: regex fallback v celém JSON stringu ---
+        raw = json.dumps(data)
+        pos = raw.find(target_str)
+        if pos > 0:
+            window = raw[max(0, pos - 3000): pos + 500]
+            for pattern in [
+                r'"temperatureMax"\s*:\s*\[([^\]]+)\]',
+                r'"calendarDayTemperatureMax"\s*:\s*\[([^\]]+)\]',
+                r'"temperature"\s*:\s*\[([^\]]+)\]',
+            ]:
+                m = re.search(pattern, window)
+                if m:
+                    nums = re.findall(r'\b(\d{2,3})\b', m.group(1))
+                    if nums:
+                        logger.debug("WU varianta D (regex): %s°F", nums[0])
+                        return float(nums[0])
+
+        return None
 
     # ------------------------------------------------------------------
     # Meteoblue (EU)
     # ------------------------------------------------------------------
 
     def _fetch_meteoblue(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
-        """
-        Meteoblue API — balíček basic-day:
-        GET https://my.meteoblue.com/packages/basic-day
-            ?lat=...&lon=...&apikey=...&format=json&temperature=C
-        """
         if not self.meteoblue_api_key:
-            raise RuntimeError(
-                "METEOBLUE_API_KEY není nastaveno. "
-                "Přidej ho do .env nebo jako env proměnnou."
-            )
+            raise RuntimeError("METEOBLUE_API_KEY není nastaveno.")
 
         params = {
-            "lat": city.lat,
-            "lon": city.lon,
+            "lat": city.lat, "lon": city.lon,
             "apikey": self.meteoblue_api_key,
-            "format": "json",
-            "temperature": "C",
+            "format": "json", "temperature": "C",
         }
-
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.get(self.METEOBLUE_BASE, params=params)
             resp.raise_for_status()
             data = resp.json()
 
-        # Struktura: data["data_day"]["time"] — list datumů
-        #            data["data_day"]["temperature_max"] — max. teploty v °C
         try:
-            days: list[str] = data["data_day"]["time"]
-            temps_max: list[float] = data["data_day"]["temperature_max"]
+            days: list[str]    = data["data_day"]["time"]
+            temps: list[float] = data["data_day"]["temperature_max"]
         except KeyError as exc:
-            raise ValueError(f"Meteoblue: neočekávaná struktura odpovědi: {exc}") from exc
+            raise ValueError(f"Meteoblue: neočekávaná struktura: {exc}") from exc
 
-        target_str = target_date.isoformat()
-        for day_str, temp_max in zip(days, temps_max):
-            if day_str == target_str:
+        for day_str, temp_max in zip(days, temps):
+            if day_str == target_date.isoformat():
                 high_c = float(temp_max)
-                # EU Polymarket kontrakty: 1 desetinné místo v °C
-                high_c_rounded = round(high_c, 1)
+                logger.info("Meteoblue %s: high=%.1f°C", city.name, high_c)
                 return WeatherForecast(
-                    city=city.name,
-                    target_date=target_date,
-                    predicted_high=high_c_rounded,
-                    unit="C",
-                    source="METEOBLUE",
+                    city=city.name, target_date=target_date,
+                    predicted_high=round(high_c, 1),
+                    unit="C", source="METEOBLUE",
                     raw_celsius=high_c,
                     fetched_at=datetime.now(timezone.utc),
                 )
@@ -303,25 +436,35 @@ def _c_to_f(c: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Testovací spuštění
+# CLI test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
+    from datetime import timedelta
     from dotenv import load_dotenv
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     load_dotenv()
 
-    from datetime import timedelta
     tomorrow = date.today() + timedelta(days=1)
     collector = WeatherCollector()
 
     print(f"\n=== Předpovědi pro {tomorrow} ===\n")
+    print(f"  {'Město':12s}  {'Provider':20s}  {'Teplota':>8s}  Zdroj")
+    print("  " + "-" * 55)
+
     for city_cfg in CITIES:
+        providers = _resolve_provider(city_cfg)
+        prov_str = " → ".join(p.upper() for p in providers)
         try:
             fc = collector.get_forecast(city_cfg.name, tomorrow)
             if fc:
-                print(f"  {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}  (zdroj: {fc.source})")
+                print(f"  {fc.city:12s}  [{prov_str:18s}]  "
+                      f"{fc.predicted_high:5.1f}°{fc.unit}  [{fc.source}]")
+            else:
+                print(f"  {city_cfg.name:12s}  [{prov_str:18s}]  — žádná data")
         except Exception as e:
-            print(f"  {city_cfg.name:12s} → CHYBA: {e}")
+            print(f"  {city_cfg.name:12s}  [{prov_str:18s}]  CHYBA: {e}")
