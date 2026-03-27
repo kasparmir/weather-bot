@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 run.py — Standalone runner pro Polymarket Weather Bot
 ======================================================
@@ -36,6 +37,7 @@ LOG_DIR.mkdir(exist_ok=True)
 
 MONITOR_INTERVAL_SEC = 120          # 2 minuty
 DAILY_BUY_HOUR_UTC   = 18           # 18:00 UTC
+FORECAST_RECHECK_INTERVAL_SEC = 3 * 3600   # každé 3 hodiny
 DASHBOARD_PORT       = 8501
 
 PYTHON = sys.executable             # stejný interpret jako runner
@@ -59,6 +61,7 @@ log = logging.getLogger("runner")
 # ---------------------------------------------------------------------------
 _dashboard_proc: subprocess.Popen | None = None
 _last_daily_buy_date: date | None = None
+_last_forecast_recheck: float = 0.0  # monotonic timestamp
 _running = True
 
 
@@ -169,6 +172,16 @@ def mark_daily_buy_done() -> None:
     _last_daily_buy_date = _now_utc().date()
 
 
+def mark_forecast_recheck_done() -> None:
+    global _last_forecast_recheck
+    _last_forecast_recheck = time.monotonic()
+
+
+def should_run_forecast_recheck(now_mono: float) -> bool:
+    """True pokud uběhlo ≥ 3 hodiny od posledního rechecku."""
+    return (now_mono - _last_forecast_recheck) >= FORECAST_RECHECK_INTERVAL_SEC
+
+
 # ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
@@ -197,6 +210,7 @@ def main() -> None:
     log.info("=" * 60)
     log.info("Polymarket Weather Bot — Runner")
     log.info("  Monitor:    každé %d s", MONITOR_INTERVAL_SEC)
+    log.info("  Fcst recheck: každé %d h", FORECAST_RECHECK_INTERVAL_SEC // 3600)
     log.info("  Daily buy:  každý den v %02d:00 UTC", DAILY_BUY_HOUR_UTC)
     log.info("  Dashboard:  %s", f"http://localhost:{args.port}" if not args.no_dashboard else "vypnuto")
     log.info("  Ukončení:   Ctrl+C")
@@ -226,6 +240,11 @@ def main() -> None:
         if now_mono - last_monitor >= MONITOR_INTERVAL_SEC:
             run_script("monitor_positions.py", "monitor")
             last_monitor = time.monotonic()
+
+        # --- Forecast recheck (každé 3 hodiny) ---
+        if should_run_forecast_recheck(now_mono):
+            run_script("forecast_recheck.py", "forecast_recheck")
+            mark_forecast_recheck_done()
 
         # --- Daily buy (18:00 UTC) ---
         if should_run_daily_buy():

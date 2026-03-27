@@ -150,30 +150,83 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
         current_price = market.yes_price
         price_change = abs(current_price - trade.current_price)
 
-        # Zkontroluj profit-take podmínku:
-        # Prodej pokud je cena >= 0.50 A zároveň alespoň +5 % nad entry.
-        # Zabraňuje okamžitému prodeji kontraktů koupených blízko (nebo nad) 0.50.
-        min_exit = max(PROFIT_THRESHOLD, trade.entry_price * 1.05)
-        if current_price >= min_exit:
-            logger.info(
-                "  🎯 PROFIT TAKE: %.4f >= %.2f (entry=%.4f +5%%) | Zahajuji prodej",
-                current_price, min_exit, trade.entry_price,
-            )
-            closed_trade = ledger.close_position(
-                trade_id=trade.id,
-                exit_price=current_price,
-                reason="CLOSED_PROFIT",
-                notes=f"profit-take: {current_price:.4f} >= {min_exit:.4f} (threshold={PROFIT_THRESHOLD}, entry={trade.entry_price:.4f})",
-            )
-            return {
-                "trade_id": trade.id,
-                "city": trade.city,
-                "action": "PROFIT_TAKE",
-                "entry_price": trade.entry_price,
-                "exit_price": current_price,
-                "pnl": closed_trade.pnl if closed_trade else 0,
-                "pnl_pct": closed_trade.pnl_pct if closed_trade else 0,
-            }
+        # Zkontroluj profit-take podmínku.
+        #
+        # Dvě varianty podle stavu předpovědi:
+        #
+        # A) Normální pozice (forecast_diverged=False):
+        #    Prodej pokud cena >= 0.50 A >= entry+5 %.
+        #
+        # B) Diverged pozice (forecast_diverged=True):
+        #    Předpověď se změnila od vstupu. Přímý exit je rizikový
+        #    (trh mohl správně ocenit nový forecast). Proto počkáme
+        #    na P&L zisk >= PROFIT_TAKE_PCT (výchozí 50 %) a pak prodáme.
+        #    Exit cena = entry_price * (1 + PROFIT_TAKE_PCT).
+
+        PROFIT_TAKE_PCT = float(os.getenv("DIVERGED_PROFIT_TAKE_PCT", "0.50"))
+
+        if trade.forecast_diverged:
+            # Čekáme na P&L zisk (ne absolutní cenu)
+            min_exit = trade.entry_price * (1.0 + PROFIT_TAKE_PCT)
+            if current_price >= min_exit:
+                pnl_pct_actual = (current_price / trade.entry_price - 1) * 100
+                logger.info(
+                    "  🎯 PROFIT TAKE [DIVERGED]: %.4f >= %.4f (entry=%.4f +%.0f%%) | P&L=+%.1f%%",
+                    current_price, min_exit, trade.entry_price,
+                    PROFIT_TAKE_PCT * 100, pnl_pct_actual,
+                )
+                closed_trade = ledger.close_position(
+                    trade_id=trade.id,
+                    exit_price=current_price,
+                    reason="CLOSED_PROFIT",
+                    notes=(
+                        f"profit-take [forecast_diverged]: {current_price:.4f} >= {min_exit:.4f} "
+                        f"(entry={trade.entry_price:.4f}, entry_forecast={trade.predicted_temp:.1f}°{trade.unit}, "
+                        f"latest_forecast={trade.latest_forecast_temp:.1f}°{trade.unit})"
+                    ),
+                )
+                return {
+                    "trade_id": trade.id,
+                    "city": trade.city,
+                    "action": "PROFIT_TAKE",
+                    "mode": "diverged",
+                    "entry_price": trade.entry_price,
+                    "exit_price": current_price,
+                    "pnl": closed_trade.pnl if closed_trade else 0,
+                    "pnl_pct": closed_trade.pnl_pct if closed_trade else 0,
+                    "entry_forecast": trade.predicted_temp,
+                    "latest_forecast": trade.latest_forecast_temp,
+                }
+            else:
+                remaining = min_exit - current_price
+                logger.info(
+                    "  🔶 DIVERGED: cena=%.4f, čeká na %.4f (+%.0f%% od entry) | zbývá +%.4f",
+                    current_price, min_exit, PROFIT_TAKE_PCT * 100, remaining,
+                )
+        else:
+            # Normální podmínka: cena >= 0.50 A >= entry+5 %
+            min_exit = max(PROFIT_THRESHOLD, trade.entry_price * 1.05)
+            if current_price >= min_exit:
+                logger.info(
+                    "  🎯 PROFIT TAKE: %.4f >= %.2f (entry=%.4f +5%%) | Zahajuji prodej",
+                    current_price, min_exit, trade.entry_price,
+                )
+                closed_trade = ledger.close_position(
+                    trade_id=trade.id,
+                    exit_price=current_price,
+                    reason="CLOSED_PROFIT",
+                    notes=f"profit-take: {current_price:.4f} >= {min_exit:.4f} (threshold={PROFIT_THRESHOLD}, entry={trade.entry_price:.4f})",
+                )
+                return {
+                    "trade_id": trade.id,
+                    "city": trade.city,
+                    "action": "PROFIT_TAKE",
+                    "mode": "normal",
+                    "entry_price": trade.entry_price,
+                    "exit_price": current_price,
+                    "pnl": closed_trade.pnl if closed_trade else 0,
+                    "pnl_pct": closed_trade.pnl_pct if closed_trade else 0,
+                }
 
         # Zkontroluj stop-loss podmínku
         if STOP_LOSS_THRESHOLD > 0:
@@ -223,6 +276,7 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
             "current_price": current_price,
             "distance_to_target": round(PROFIT_THRESHOLD - current_price, 4),
             "stop_price": round(trade.entry_price * (1.0 - STOP_LOSS_THRESHOLD), 4) if STOP_LOSS_THRESHOLD > 0 else None,
+            "forecast_diverged": trade.forecast_diverged,
         }
 
     except Exception as exc:
@@ -273,9 +327,11 @@ def _print_summary(results: dict) -> None:
                 )
             elif action == "PRICE_UPDATED":
                 dist = pos.get("distance_to_target", "?")
+                div_flag = " [⚠️DIVERGED]" if pos.get("forecast_diverged") else ""
+                stop_str = f" stop={pos['stop_price']:.4f}" if pos.get("stop_price") else ""
                 print(
                     f"   {icon} {pos['city']:12s} {pos.get('current_price', 0):.4f} "
-                    f"(do targetu: {dist:.4f})"
+                    f"(do targetu: {dist:.4f}){stop_str}{div_flag}"
                 )
             elif action == "SETTLEMENT":
                 print(
