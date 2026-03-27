@@ -10,6 +10,7 @@ Workflow:
 """
 
 from __future__ import annotations
+from typing import Optional
 
 import json
 import logging
@@ -27,6 +28,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 from weather_api import WeatherCollector, WeatherForecast
 from polymarket_gamma import PolymarketGamma
 from ledger import PaperLedger, TRADES_CSV, PORTFOLIO_JSON, BALANCE_HISTORY_CSV, DATA_DIR
+from edge import check_edge, compute_edge, extract_market_info, MIN_EDGE
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -159,9 +161,7 @@ def _process_forecast(
         market.last_trade_price,
     )
 
-    # entry_price = outcomePrices[0] (YES cena) — bestAsk v Gamma API
-    # NENÍ cena YES tokenu, je to globální order book ask a nespolehlivý.
-    # yes_price pochází přímo z outcomePrices[] což je authoritative zdroj.
+    # entry_price = outcomePrices[0] (YES cena)
     entry_price = market.yes_price
     if entry_price <= 0.02 or entry_price >= 0.98:
         reason = f"entry_price mimo rozsah: {entry_price:.4f}"
@@ -175,6 +175,29 @@ def _process_forecast(
             "entry_price": entry_price,
             "reason": reason,
         }
+
+    # Edge filter: vstoupit pouze pokud máme dostatečný edge
+    threshold: Optional[float] = None
+    direction: str = "unknown"
+    threshold, direction = extract_market_info(
+        market.market_slug, market.question, forecast.unit
+    )
+    if threshold is not None:
+        edge_result = check_edge(forecast, threshold, direction, entry_price)
+        if not edge_result.passes:
+            return {
+                "city": forecast.city,
+                "action": "SKIPPED",
+                "market_slug": market.market_slug,
+                "predicted_temp": forecast.predicted_high,
+                "unit": forecast.unit,
+                "entry_price": entry_price,
+                "our_probability": round(edge_result.our_probability, 3),
+                "edge": round(edge_result.edge, 3),
+                "reason": f"edge_filter: {edge_result.reason}",
+            }
+    else:
+        logger.debug("  Edge: práh nelze určit pro %s, pokračuji bez filtru", market.market_slug)
 
     # Otevři pozici
     trade = ledger.open_position(
@@ -198,6 +221,15 @@ def _process_forecast(
             "reason": "ledger_rejected",
         }
 
+    # Edge pro logování
+    edge_info = {}
+    if threshold is not None:
+        edge_result = compute_edge(forecast, threshold, direction, entry_price)
+        edge_info = {
+            "our_probability": round(edge_result.our_probability, 3),
+            "edge": round(edge_result.edge, 3),
+        }
+
     return {
         "city": forecast.city,
         "action": "OPENED",
@@ -207,6 +239,7 @@ def _process_forecast(
         "unit": forecast.unit,
         "entry_price": entry_price,
         "yes_price_pct": market.yes_price_pct,
+        **edge_info,
     }
 
 
@@ -220,7 +253,12 @@ def _print_summary(results: dict, forecasts: list[WeatherForecast]) -> None:
 
     print(f"\n📊 PŘEDPOVĚDI POČASÍ ({results['forecasts_fetched']} měst):")
     for fc in forecasts:
-        print(f"   {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}  [{fc.source}]")
+        sigma_str = f" σ={fc.std_dev:.1f}°" if fc.std_dev > 0 else ""
+        vals_str = ""
+        if fc.ensemble_values:
+            vals_str = " [" + ", ".join(f"{s}={v:.0f}" for s, v in
+                       zip(fc.ensemble_sources, fc.ensemble_values)) + "]"
+        print(f"   {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}{sigma_str}  [{fc.source}]{vals_str}")
 
     print(f"\n💰 OBCHODOVÁNÍ:")
     print(f"   Nalezeno trhů:     {results['markets_found']}")

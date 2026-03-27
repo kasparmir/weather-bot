@@ -4,17 +4,20 @@ weather_api.py — WeatherCollector
 Providery:
   NOAA          — USA, zdarma, bez API klíče
   WUNDERGROUND  — USA, scraper (bez API klíče)
+  OPENMETEO     — USA+EU, zdarma, bez API klíče
   METEOBLUE     — EU, API klíč (METEOBLUE_API_KEY)
 
 Konfigurace providerů — env proměnné:
   USA_WEATHER_PROVIDER=noaa                    # default pro všechna US města
-  USA_WEATHER_PROVIDER=wunderground            # přepne všechna US města na WU
-  USA_WEATHER_PROVIDER=noaa,wunderground       # NOAA primárně, WU jako fallback
+  USA_WEATHER_PROVIDER=wunderground,openmeteo  # WU primárně, open-meteo fallback
 
-Per-město (přepíše globální nastavení):
+Per-město:
   WEATHER_PROVIDER_NEW_YORK=wunderground
-  WEATHER_PROVIDER_DALLAS=noaa,wunderground
-  (název města UPPERCASE, mezery → _)
+  (název UPPERCASE, mezery → _)
+
+Ensemble mód (průměr více zdrojů, doporučeno):
+  ENSEMBLE_PROVIDERS=noaa,openmeteo            # US města
+  ENSEMBLE_PROVIDERS=noaa,openmeteo,meteoblue  # globálně (meteoblue jen pro EU)
 """
 
 from __future__ import annotations
@@ -98,12 +101,16 @@ class WeatherForecast:
     target_date: date
     predicted_high: float
     unit: str
-    source: str
+    source: str                        # provider nebo "ENSEMBLE"
     raw_celsius: float
     fetched_at: datetime
+    # Ensemble metadata (vyplněno jen při ensemble módu)
+    ensemble_values: list[float] = field(default_factory=list)  # hodnoty od každého providera
+    ensemble_sources: list[str]  = field(default_factory=list)  # jejich názvy
+    std_dev: float = 0.0               # směrodatná odchylka ensemble (míra nejistoty)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "city": self.city,
             "target_date": self.target_date.isoformat(),
             "predicted_high": round(self.predicted_high, 1),
@@ -112,6 +119,11 @@ class WeatherForecast:
             "raw_celsius": round(self.raw_celsius, 1),
             "fetched_at": self.fetched_at.isoformat(),
         }
+        if self.ensemble_values:
+            d["ensemble_values"] = [round(v, 1) for v in self.ensemble_values]
+            d["ensemble_sources"] = self.ensemble_sources
+            d["std_dev"] = round(self.std_dev, 2)
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +153,13 @@ class WeatherCollector:
         self.meteoblue_api_key = meteoblue_api_key or os.getenv("METEOBLUE_API_KEY", "")
         self.timeout = timeout
         self._noaa_grid_cache: dict[str, dict] = {}
+        # Ensemble: seznam providerů přes env ENSEMBLE_PROVIDERS=noaa,openmeteo
+        # Prázdné = bez ensemble (použij standardní provider chain)
+        self._ensemble_providers = [
+            p.strip().lower()
+            for p in os.getenv("ENSEMBLE_PROVIDERS", "").split(",")
+            if p.strip()
+        ]
 
     # ------------------------------------------------------------------
     # Veřejné metody
@@ -162,6 +181,11 @@ class WeatherCollector:
         if not city:
             raise ValueError(f"Neznámé město: {city_name!r}. Dostupná: {list(CITY_MAP)}")
 
+        # Ensemble mód: více providerů paralelně → zprůměrovat
+        if self._ensemble_providers and city.unit in ("F", "C"):
+            return self._get_ensemble_forecast(city, target_date)
+
+        # Standardní mód: první úspěšný provider
         providers = _resolve_provider(city)
         last_exc: Optional[Exception] = None
 
@@ -179,12 +203,89 @@ class WeatherCollector:
             raise last_exc
         return None
 
+    def _get_ensemble_forecast(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
+        """
+        Ensemble forecast: sběr předpovědí od všech ENSEMBLE_PROVIDERS,
+        výsledek = průměr (nebo medián při velkém rozptylu).
+
+        Logika:
+          1. Dotaž se každého providera nezávisle.
+          2. Odfiltruj outliers (hodnoty > 2σ od průměru).
+          3. Výsledná předpověď = zaokrouhlený průměr zbývajících.
+          4. std_dev = míra nejistoty (vysoký → menší pozice v edge filteru).
+        """
+        import statistics
+
+        values: list[float] = []
+        sources: list[str] = []
+
+        for provider in self._ensemble_providers:
+            try:
+                fc = self._fetch_by_provider(provider, city, target_date)
+                if fc:
+                    values.append(fc.predicted_high)
+                    sources.append(fc.source)
+                    logger.info("Ensemble %s [%s]: %.1f°%s",
+                                city.name, provider.upper(), fc.predicted_high, city.unit)
+            except Exception as exc:
+                logger.warning("Ensemble %s [%s]: %s", city.name, provider.upper(), exc)
+
+        if not values:
+            return None
+
+        # Outlier removal při 3+ zdrojích (median-based + absolutní limit)
+        # 2σ nestačí při malém počtu zdrojů → použijeme medián + pevný práh
+        # Práh: 10°F (≈5.5°C) — předpovědi se reálně nerozcházejí víc
+        if len(values) >= 3:
+            import statistics as _stats
+            med = _stats.median(values)
+            max_dev = 10.0 if city.unit == "F" else 5.5
+            filtered = [(v, s) for v, s in zip(values, sources)
+                        if abs(v - med) <= max_dev]
+            if filtered and len(filtered) >= 2:
+                values, sources = zip(*filtered)  # type: ignore
+                values, sources = list(values), list(sources)
+                if len(values) < len(filtered) + 1:  # byl odfiltrován alespoň 1
+                    logger.info("Ensemble %s: outlier odfiltrován, zbývá %d zdrojů",
+                                city.name, len(values))
+
+        mean_val = statistics.mean(values)
+        std = statistics.stdev(values) if len(values) > 1 else 0.0
+
+        # Zaokrouhlení stejně jako jednotlivé providery
+        if city.unit == "F":
+            predicted = float(int(mean_val + 0.5))
+        else:
+            predicted = round(mean_val, 1)
+
+        raw_c = _f_to_c(mean_val) if city.unit == "F" else mean_val
+        src_label = "+".join(sources)
+
+        logger.info(
+            "Ensemble %s: high=%.1f°%s (σ=%.1f) z [%s]",
+            city.name, predicted, city.unit, std,
+            ", ".join(f"{s}={v:.1f}" for s, v in zip(sources, values)),
+        )
+
+        return WeatherForecast(
+            city=city.name, target_date=target_date,
+            predicted_high=predicted,
+            unit=city.unit, source=f"ENSEMBLE({src_label})",
+            raw_celsius=raw_c,
+            fetched_at=datetime.now(timezone.utc),
+            ensemble_values=list(values),
+            ensemble_sources=list(sources),
+            std_dev=std,
+        )
+
     def _fetch_by_provider(self, provider: str, city: CityConfig,
                            target_date: date) -> Optional[WeatherForecast]:
         if provider == "noaa":
             return self._fetch_noaa(city, target_date)
-        elif provider == "wunderground":
+        elif provider in ("wunderground", "wu"):
             return self._fetch_wunderground(city, target_date)
+        elif provider in ("openmeteo", "open-meteo", "open_meteo"):
+            return self._fetch_openmeteo(city, target_date)
         elif provider == "meteoblue":
             return self._fetch_meteoblue(city, target_date)
         raise ValueError(f"Neznámý provider: {provider!r}")
@@ -243,20 +344,49 @@ class WeatherCollector:
     def _fetch_wunderground(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
         """
         Scraper pro wunderground.com/forecast/{wu_slug}.
-        Extrahuje __NEXT_DATA__ JSON vložený do stránky.
+        Zkouší dvě URL varianty. Detekuje captchu/blokování.
+        Při selhání vyhodí RuntimeError → caller přejde na next provider.
         """
         if not city.wu_slug:
             raise ValueError(f"wu_slug není nastaven pro {city.name}")
 
-        url = f"{self.WU_BASE}/{city.wu_slug}"
+        urls = [
+            f"{self.WU_BASE}/{city.wu_slug}",
+            f"https://www.wunderground.com/hourly/{city.wu_slug}",
+        ]
+        html: Optional[str] = None
+        used_url = urls[0]
+        last_err: Optional[Exception] = None
+
         with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
-            resp = client.get(url, headers=self._WU_HEADERS)
-            resp.raise_for_status()
-            html = resp.text
+            for url in urls:
+                try:
+                    resp = client.get(url, headers=self._WU_HEADERS)
+                    if resp.status_code != 200:
+                        logger.debug("WU %s: HTTP %d", city.name, resp.status_code)
+                        continue
+                    body = resp.text
+                    if len(body) < 5000 or "__NEXT_DATA__" not in body:
+                        logger.debug("WU %s: stránka neobsahuje data (%d B) — možná captcha",
+                                     city.name, len(body))
+                        continue
+                    html = body
+                    used_url = url
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    logger.debug("WU %s %s: %s", city.name, url, exc)
+
+        if not html:
+            raise RuntimeError(
+                f"WU: nepodařilo se načíst data pro {city.name} "
+                f"(captcha / blokováno). Použij OPENMETEO jako fallback."
+                + (f" Poslední chyba: {last_err}" if last_err else "")
+            )
 
         data = self._wu_extract_next_data(html)
         if not data:
-            raise RuntimeError(f"WU __NEXT_DATA__ nenalezen ({url})")
+            raise RuntimeError(f"WU __NEXT_DATA__ nenalezen ({used_url})")
 
         high_f = self._wu_parse_daily_high(data, target_date)
         if high_f is None:
@@ -272,18 +402,83 @@ class WeatherCollector:
         )
 
     def _wu_extract_next_data(self, html: str) -> Optional[dict]:
-        """Extrahuje JSON z <script id="__NEXT_DATA__">."""
-        m = re.search(
-            r'<script\s+id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.*?\})\s*</script>',
-            html, re.DOTALL,
-        )
-        if not m:
+        """
+        Extrahuje JSON z <script id="__NEXT_DATA__">.
+        Nepoužívá .*? přes celé HTML — najde tag a parsuje od první {.
+        """
+        tag_pos = html.find('id="__NEXT_DATA__"')
+        if tag_pos == -1:
+            tag_pos = html.find("id='__NEXT_DATA__'")
+        if tag_pos == -1:
             return None
+        gt_pos = html.find(">", tag_pos)
+        if gt_pos == -1:
+            return None
+        json_start = html.find("{", gt_pos)
+        if json_start == -1:
+            return None
+        script_end = html.find("</script>", json_start)
+        if script_end == -1:
+            return None
+        json_str = html[json_start:script_end].strip()
         try:
-            return json.loads(m.group(1))
+            return json.loads(json_str)
         except json.JSONDecodeError as exc:
-            logger.error("WU JSON parse: %s", exc)
+            logger.error("WU JSON parse: %s (len=%d)", exc, len(json_str))
             return None
+
+    # ------------------------------------------------------------------
+    # Open-Meteo (zdarma, bez API klíče)
+    # ------------------------------------------------------------------
+
+    def _fetch_openmeteo(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
+        """
+        Open-Meteo API — https://open-meteo.com
+        Zdarma, bez registrace. Vrací hodinové teploty v lokálním čase.
+        Bere maximum ze všech hodin daného dne.
+        """
+        unit_param = "fahrenheit" if city.unit == "F" else "celsius"
+        params = {
+            "latitude": city.lat,
+            "longitude": city.lon,
+            "hourly": "temperature_2m",
+            "temperature_unit": unit_param,
+            "timezone": "auto",
+            "forecast_days": 7,
+        }
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        times: list[str]   = data["hourly"]["time"]
+        temps: list[float] = data["hourly"]["temperature_2m"]
+        target_str = target_date.isoformat()
+
+        day_temps = [t for ts, t in zip(times, temps)
+                     if ts.startswith(target_str) and t is not None]
+
+        if not day_temps:
+            logger.warning("OpenMeteo: žádná data pro %s %s", city.name, target_date)
+            return None
+
+        high = max(day_temps)
+        if city.unit == "F":
+            predicted = float(int(high + 0.5))
+            raw_c = _f_to_c(high)
+        else:
+            predicted = round(high, 1)
+            raw_c = high
+
+        logger.info("OpenMeteo %s: high=%.1f°%s (max z %d hodin)",
+                    city.name, predicted, city.unit, len(day_temps))
+        return WeatherForecast(
+            city=city.name, target_date=target_date,
+            predicted_high=predicted,
+            unit=city.unit, source="OPENMETEO",
+            raw_celsius=raw_c,
+            fetched_at=datetime.now(timezone.utc),
+        )
 
     def _wu_parse_daily_high(self, data: dict, target_date: date) -> Optional[float]:
         """
