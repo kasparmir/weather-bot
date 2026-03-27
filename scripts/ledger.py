@@ -43,12 +43,15 @@ CSV_FIELDNAMES = [
     "entry_timestamp",
     "current_price",
     "last_checked",
-    "status",          # OPEN | CLOSED_PROFIT | CLOSED_SETTLEMENT | CLOSED_MANUAL
+    "status",          # OPEN | CLOSED_PROFIT | CLOSED_SETTLEMENT | CLOSED_STOP_LOSS | CLOSED_MANUAL
     "exit_price",
     "exit_timestamp",
     "pnl",             # profit/loss v $
     "pnl_pct",         # profit/loss v %
     "notes",
+    "forecast_diverged",     # "1" pokud aktuální předpověď nesedí s entry
+    "latest_forecast_temp",  # poslední předpověď (může se lišit od predicted_temp)
+    "forecast_checked_at",   # kdy byl naposledy proveden recheck předpovědi
 ]
 
 TradeStatus = Literal[
@@ -84,9 +87,15 @@ class Trade:
     pnl: float = 0.0
     pnl_pct: float = 0.0
     notes: str = ""
+    forecast_diverged: bool = False          # True = aktuální forecast se liší od entry
+    latest_forecast_temp: float = 0.0       # poslední re-check forecast hodnota
+    forecast_checked_at: str = ""           # ISO UTC posledního rechecku
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Serializuj bool jako "1"/"0" pro CSV kompatibilitu
+        d["forecast_diverged"] = "1" if self.forecast_diverged else "0"
+        return d
 
 
 @dataclass
@@ -421,11 +430,40 @@ class PaperLedger:
                         pnl=float(row.get("pnl") or 0),
                         pnl_pct=float(row.get("pnl_pct") or 0),
                         notes=row.get("notes", ""),
+                        forecast_diverged=row.get("forecast_diverged", "").lower() in ("1", "true"),
+                        latest_forecast_temp=float(row.get("latest_forecast_temp") or 0),
+                        forecast_checked_at=row.get("forecast_checked_at", ""),
                     )
                     trades.append(trade)
                 except Exception as exc:
                     logger.error("Chyba čtení řádku CSV: %s | %s", exc, row)
         return trades
+
+    def mark_forecast_diverged(
+        self,
+        trade_id: str,
+        latest_forecast_temp: float,
+        diverged: bool = True,
+    ) -> Optional[Trade]:
+        """
+        Označí pozici jako forecast_diverged.
+        Ukládá aktuální předpověď a timestamp rechecku.
+        """
+        trade = self._find_trade(trade_id)
+        if not trade or trade.status != "OPEN":
+            return None
+        trade.forecast_diverged = diverged
+        trade.latest_forecast_temp = latest_forecast_temp
+        trade.forecast_checked_at = _now_iso()
+        self._update_trade_row(trade)
+        logger.info(
+            "📡 Forecast recheck %s (%s): entry=%.1f°%s → now=%.1f°%s | diverged=%s",
+            trade.city, trade_id,
+            trade.predicted_temp, trade.unit,
+            latest_forecast_temp, trade.unit,
+            diverged,
+        )
+        return trade
 
     def _find_trade(self, trade_id: str) -> Optional[Trade]:
         for t in self._read_all_trades():
