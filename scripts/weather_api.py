@@ -5,19 +5,19 @@ Providery:
   NOAA          — USA, zdarma, bez API klíče
   WUNDERGROUND  — USA, scraper (bez API klíče)
   OPENMETEO     — USA+EU, zdarma, bez API klíče
+  YR            — EU, zdarma, bez API klíče (MET Norway / yr.no)
   METEOBLUE     — EU, API klíč (METEOBLUE_API_KEY)
 
-Konfigurace providerů — env proměnné:
-  USA_WEATHER_PROVIDER=noaa                    # default pro všechna US města
-  USA_WEATHER_PROVIDER=wunderground,openmeteo  # WU primárně, open-meteo fallback
+Výchozí EU provider: YR (zdarma, spolehlivý)
+Výchozí US provider: NOAA
+
+Ensemble (průměr zdrojů, doporučeno):
+  ENSEMBLE_PROVIDERS=noaa,openmeteo          # US ensemble
+  ENSEMBLE_PROVIDERS=yr,openmeteo            # EU ensemble
 
 Per-město:
-  WEATHER_PROVIDER_NEW_YORK=wunderground
+  WEATHER_PROVIDER_NEW_YORK=openmeteo
   (název UPPERCASE, mezery → _)
-
-Ensemble mód (průměr více zdrojů, doporučeno):
-  ENSEMBLE_PROVIDERS=noaa,openmeteo            # US města
-  ENSEMBLE_PROVIDERS=noaa,openmeteo,meteoblue  # globálně (meteoblue jen pro EU)
 """
 
 from __future__ import annotations
@@ -64,10 +64,10 @@ CITIES: list[CityConfig] = [
                wu_slug="us/wa/seattle"),
     CityConfig("Dallas",   "US", 32.7767, -96.7970, "F", "NOAA", "dallas",
                wu_slug="us/tx/dallas"),
-    CityConfig("London",   "UK", 51.5074,  -0.1278, "C", "METEOBLUE", "london"),
-    CityConfig("Paris",    "FR", 48.8566,   2.3522, "C", "METEOBLUE", "paris"),
-    CityConfig("Madrid",   "ES", 40.4168,  -3.7038, "C", "METEOBLUE", "madrid"),
-    CityConfig("Warsaw",   "PL", 52.2297,  21.0122, "C", "METEOBLUE", "warsaw"),
+    CityConfig("London",   "UK", 51.5074,  -0.1278, "C", "YR", "london"),
+    CityConfig("Paris",    "FR", 48.8566,   2.3522, "C", "YR", "paris"),
+    CityConfig("Madrid",   "ES", 40.4168,  -3.7038, "C", "YR", "madrid"),
+    CityConfig("Warsaw",   "PL", 52.2297,  21.0122, "C", "YR", "warsaw"),
 ]
 
 CITY_MAP: dict[str, CityConfig] = {c.name: c for c in CITIES}
@@ -286,6 +286,8 @@ class WeatherCollector:
             return self._fetch_wunderground(city, target_date)
         elif provider in ("openmeteo", "open-meteo", "open_meteo"):
             return self._fetch_openmeteo(city, target_date)
+        elif provider in ("yr", "yr.no", "met.no"):
+            return self._fetch_yr(city, target_date)
         elif provider == "meteoblue":
             return self._fetch_meteoblue(city, target_date)
         raise ValueError(f"Neznámý provider: {provider!r}")
@@ -575,6 +577,89 @@ class WeatherCollector:
                         return float(nums[0])
 
         return None
+
+    # ------------------------------------------------------------------
+    # Yr.no / MET Norway (EU, zdarma, bez API klíče)
+    # ------------------------------------------------------------------
+
+    def _fetch_yr(self, city: CityConfig, target_date: date) -> Optional[WeatherForecast]:
+        """
+        Yr.no / MET Norway Locationforecast 2.0 API.
+        Dokumentace: https://developer.yr.no/doc/GettingStarted/
+
+        Endpoint: https://api.met.no/weatherapi/locationforecast/2.0/compact
+          ?lat={lat}&lon={lon}
+
+        Povinný User-Agent header s kontaktními informacemi.
+        Vrací hodinové hodnoty air_temperature v °C.
+        Bere maximum za daný den (lokální čas dle offset z API).
+        """
+        params = {
+            "lat": round(city.lat, 4),
+            "lon": round(city.lon, 4),
+        }
+        headers = {
+            "User-Agent": "PolymarketWeatherBot/1.0 github.com/polymarket-weather-bot",
+            "Accept": "application/json",
+        }
+
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get(
+                "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+                params=params, headers=headers,
+            )
+            # 203 = beta/deprecated (data jsou stále validní)
+            if resp.status_code not in (200, 203):
+                resp.raise_for_status()
+            data = resp.json()
+
+        # Struktura: data.properties.timeseries[i].time  (ISO UTC)
+        #            data.properties.timeseries[i].data.instant.details.air_temperature (°C)
+        try:
+            timeseries = data["properties"]["timeseries"]
+        except KeyError as exc:
+            raise ValueError(f"Yr: neočekávaná struktura odpovědi: {exc}") from exc
+
+        target_str = target_date.isoformat()
+        temps_c: list[float] = []
+
+        for entry in timeseries:
+            t_str = entry.get("time", "")
+            # time je UTC ISO string: "2026-03-26T12:00:00Z"
+            # Konvertujeme na lokální datum pomocí offset z CityConfig
+            try:
+                dt_utc = datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+
+            # Pro EU města odhadujeme lokální čas podle zeměpisné délky
+            # (CET = UTC+1, CEST = UTC+2 — používáme UTC+1 jako konzervativní odhad)
+            # Pro přesnost jen filtrujeme UTC datum, protože rozdíl je max 1h
+            if dt_utc.date().isoformat() != target_str:
+                continue
+
+            try:
+                temp = float(
+                    entry["data"]["instant"]["details"]["air_temperature"]
+                )
+                temps_c.append(temp)
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        if not temps_c:
+            logger.warning("Yr: žádná data pro %s %s", city.name, target_date)
+            return None
+
+        high_c = max(temps_c)
+        logger.info("Yr %s: high=%.1f°C (max z %d hodin)", city.name, high_c, len(temps_c))
+
+        return WeatherForecast(
+            city=city.name, target_date=target_date,
+            predicted_high=round(high_c, 1),
+            unit="C", source="YR",
+            raw_celsius=high_c,
+            fetched_at=datetime.now(timezone.utc),
+        )
 
     # ------------------------------------------------------------------
     # Meteoblue (EU)

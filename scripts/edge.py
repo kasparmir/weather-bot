@@ -7,12 +7,12 @@ naší odhadovanou pravděpodobností výhry a tržní cenou YES.
 Logika:
   1. Forecast → pravděpodobnost (pomocí normálního rozdělení).
   2. Edge = naše_prob - tržní_cena_YES.
-  3. Vstoupit pouze pokud Edge >= MIN_EDGE (výchozí 0.08 = 8 %).
+  3. Vstoupit pouze pokud Edge >= MIN_EDGE (výchozí 0.03 = 3 %).
   4. Confidence weight: při vysokém std_dev (nejistá ensemble) snížit
      efektivní pravděpodobnost a vyžadovat větší edge.
 
 Konfigurace (env proměnné):
-  MIN_EDGE=0.08              # minimální edge pro vstup (výchozí 8 %)
+  MIN_EDGE=0.03              # minimální edge pro vstup (výchozí 3 %)
   FORECAST_SIGMA_F=3.0       # nejistota předpovědi v °F (výchozí ±3°F)
   FORECAST_SIGMA_C=1.5       # nejistota předpovědi v °C (výchozí ±1.5°C)
   EDGE_ENSEMBLE_SIGMA=true   # použít std_dev z ensemble jako sigma (výchozí true)
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Konfigurace
 # ---------------------------------------------------------------------------
 
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 # Výchozí směrodatná odchylka předpovědi (nejistota)
 # NOAA 24h forecast: typicky ±3°F / ±1.5°C
 FORECAST_SIGMA_F = float(os.getenv("FORECAST_SIGMA_F", "3.0"))

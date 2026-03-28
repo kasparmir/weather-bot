@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 # Konstanty
 # ---------------------------------------------------------------------------
 
-INITIAL_BALANCE = 1000.0          # $1000 USDC virtuální balance
-POSITION_SIZE = 10.0              # $ na jednu pozici
+INITIAL_BALANCE = 100.0           # $100 USDC virtuální balance
+POSITION_SIZE = 4.0               # $ na jednu pozici
 PROFIT_TAKE_THRESHOLD = 0.50      # 50% → prodej (cena >= 0.50)
 
 # Cesty k datovým souborům (lze přepsat env proměnnými)
