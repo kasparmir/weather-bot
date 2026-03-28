@@ -49,25 +49,30 @@ class CityConfig:
     api_source: str         # default provider
     polymarket_name: str
     wu_slug: str = ""       # Weather Underground URL slug, např. "us/ny/new-york-city"
+    timezone: str = "UTC"   # IANA timezone string, např. "America/New_York"
 
 
 CITIES: list[CityConfig] = [
     CityConfig("New York", "US", 40.7128, -74.0060, "F", "NOAA", "nyc",
-               wu_slug="us/ny/new-york-city"),
+               wu_slug="us/ny/new-york-city", timezone="America/New_York"),
     CityConfig("Atlanta",  "US", 33.7490, -84.3880, "F", "NOAA", "atlanta",
-               wu_slug="us/ga/atlanta"),
+               wu_slug="us/ga/atlanta",       timezone="America/New_York"),
     CityConfig("Chicago",  "US", 41.8781, -87.6298, "F", "NOAA", "chicago",
-               wu_slug="us/il/chicago"),
+               wu_slug="us/il/chicago",       timezone="America/Chicago"),
     CityConfig("Miami",    "US", 25.7617, -80.1918, "F", "NOAA", "miami",
-               wu_slug="us/fl/miami"),
+               wu_slug="us/fl/miami",         timezone="America/New_York"),
     CityConfig("Seattle",  "US", 47.6062, -122.3321, "F", "NOAA", "seattle",
-               wu_slug="us/wa/seattle"),
+               wu_slug="us/wa/seattle",       timezone="America/Los_Angeles"),
     CityConfig("Dallas",   "US", 32.7767, -96.7970, "F", "NOAA", "dallas",
-               wu_slug="us/tx/dallas"),
-    CityConfig("London",   "UK", 51.5074,  -0.1278, "C", "YR", "london"),
-    CityConfig("Paris",    "FR", 48.8566,   2.3522, "C", "YR", "paris"),
-    CityConfig("Madrid",   "ES", 40.4168,  -3.7038, "C", "YR", "madrid"),
-    CityConfig("Warsaw",   "PL", 52.2297,  21.0122, "C", "YR", "warsaw"),
+               wu_slug="us/tx/dallas",        timezone="America/Chicago"),
+    CityConfig("London",   "UK", 51.5074,  -0.1278, "C", "YR", "london",
+               timezone="Europe/London"),
+    CityConfig("Paris",    "FR", 48.8566,   2.3522, "C", "YR", "paris",
+               timezone="Europe/Paris"),
+    CityConfig("Madrid",   "ES", 40.4168,  -3.7038, "C", "YR", "madrid",
+               timezone="Europe/Madrid"),
+    CityConfig("Warsaw",   "PL", 52.2297,  21.0122, "C", "YR", "warsaw",
+               timezone="Europe/Warsaw"),
 ]
 
 CITY_MAP: dict[str, CityConfig] = {c.name: c for c in CITIES}

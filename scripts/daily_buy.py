@@ -1,16 +1,25 @@
 """
-daily_buy.py — Denní nákupní skript
-Spouštěn každý den v 18:00 UTC přes OpenClaw cron.
+daily_buy.py — Nákupní skript (hodinový, timezone-aware)
+=========================================================
+Spouštěn každou hodinu z run.py nebo cronu.
 
-Workflow:
-  1. Získá předpovědi pro všechna města (NOAA + Meteoblue)
-  2. Najde odpovídající kontrakty na Polymarketu
-  3. Otevře papírové pozice
-  4. Zapíše výsledky do logu (čitelné pro OpenClaw)
+Logika výběru okna:
+  - Pro každé město zjistíme aktuální lokální čas.
+  - Nákup proběhne jen pokud jsme v okně:
+      (BUY_HOURS_BEFORE) hodin před půlnocí → 0:00 místního času
+    Příklad (BUY_HOURS_BEFORE=4): nákup probíhá v 20:00–23:59 lokálně.
+  - Target date = zítřek v lokálním čase daného města.
+  - Časová kontrola se provede PŘED voláním weather API → nezatěžujeme
+    API pro města, která jsou mimo nákupní okno.
+  - Duplikáty jsou blokovány ledgerem (city + target_date unique constraint).
+
+Konfigurace:
+  BUY_HOURS_BEFORE=4    # počet hodin před půlnocí (výchozí: 4)
 """
 
 from __future__ import annotations
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import json
 import logging
@@ -19,13 +28,12 @@ import sys
 from datetime import date, timedelta, timezone, datetime
 from pathlib import Path
 
-# Přidáme scripts/ do Python path pokud spouštíme přímo
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from weather_api import WeatherCollector, WeatherForecast
+from weather_api import WeatherCollector, WeatherForecast, CITY_MAP, CITIES, CityConfig
 from polymarket_gamma import PolymarketGamma
 from ledger import PaperLedger, TRADES_CSV, PORTFOLIO_JSON, BALANCE_HISTORY_CSV, DATA_DIR
 from edge import check_edge, compute_edge, extract_market_info, MIN_EDGE
@@ -46,6 +54,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("daily_buy")
 
+# ---------------------------------------------------------------------------
+# Konfigurace
+# ---------------------------------------------------------------------------
+# Počet hodin před půlnocí místního času kdy se provádí nákup
+# Výchozí: 4 → okno 20:00–23:59 lokálně
+BUY_HOURS_BEFORE = int(os.getenv("BUY_HOURS_BEFORE", "4"))
+
+
+# ---------------------------------------------------------------------------
+# Timezone logika
+# ---------------------------------------------------------------------------
+
+def _city_local_now(city: CityConfig) -> datetime:
+    """Aktuální čas v časovém pásmu daného města."""
+    return datetime.now(ZoneInfo(city.timezone))
+
+
+def _is_in_buy_window(city: CityConfig, now_utc: datetime) -> tuple[bool, date | None]:
+    """
+    Zkontroluje, zda jsme v nákupním okně pro dané město.
+
+    Okno: posledních BUY_HOURS_BEFORE hodin před půlnocí.
+    Příklad (BUY_HOURS_BEFORE=4): 20:00–23:59 lokálně.
+
+    Vrací (True, target_date) nebo (False, None).
+    target_date = zítřek v lokálním čase města.
+    """
+    local_now = now_utc.astimezone(ZoneInfo(city.timezone))
+    local_hour = local_now.hour  # 0–23
+
+    # Okno: od (24 - BUY_HOURS_BEFORE) do 23:59
+    window_start = 24 - BUY_HOURS_BEFORE  # např. 20 pro BUY_HOURS_BEFORE=4
+
+    if local_hour >= window_start:
+        # Jsme v okně → target = zítřek v lokálním čase
+        target = local_now.date() + timedelta(days=1)
+        return True, target
+
+    return False, None
+
 
 # ---------------------------------------------------------------------------
 # Hlavní funkce
@@ -53,66 +101,110 @@ logger = logging.getLogger("daily_buy")
 
 def run_daily_buy() -> dict:
     """
-    Spustí denní nákupní cyklus.
-    Vrátí summary dict (OpenClaw ho vypíše jako zprávu).
+    Projde všechna města, pro každé zkontroluje časové okno,
+    a pokud je v okně a nemá ještě pozici, nakoupí.
     """
-    tomorrow = date.today() + timedelta(days=1)
-    logger.info("=== DENNÍ NÁKUP === Target date: %s", tomorrow)
+    now_utc = datetime.now(timezone.utc)
+    logger.info("=== NÁKUPNÍ KONTROLA === %s UTC", now_utc.strftime("%Y-%m-%d %H:%M"))
+    logger.info("BUY_HOURS_BEFORE=%d (okno %02d:00–23:59 lokálně)",
+                BUY_HOURS_BEFORE, 24 - BUY_HOURS_BEFORE)
 
-    collector = WeatherCollector(
-        meteoblue_api_key=os.getenv("METEOBLUE_API_KEY", ""),
-    )
+    collector = WeatherCollector(meteoblue_api_key=os.getenv("METEOBLUE_API_KEY", ""))
     gamma = PolymarketGamma()
     ledger = PaperLedger()
 
     results = {
-        "run_at": datetime.now(timezone.utc).isoformat(),
-        "target_date": tomorrow.isoformat(),
+        "run_at": now_utc.isoformat(),
+        "buy_hours_before": BUY_HOURS_BEFORE,
         "forecasts_fetched": 0,
         "markets_found": 0,
         "positions_opened": 0,
         "positions_skipped": 0,
+        "cities_outside_window": 0,
         "errors": [],
         "trades": [],
         "portfolio_balance": ledger.portfolio.balance,
     }
 
-    # --- 1. Získej předpovědi počasí ---
-    logger.info("Získávám předpovědi počasí pro %d měst...", 10)
-    forecasts = collector.get_all_forecasts(tomorrow)
-    results["forecasts_fetched"] = len(forecasts)
-    logger.info("Získáno %d předpovědí", len(forecasts))
+    # Načti otevřené pozice jednou — pro rychlou duplicate check
+    open_positions = {
+        (t.city, t.target_date)
+        for t in ledger.get_open_trades()
+    }
 
-    if not forecasts:
-        msg = "Žádné předpovědi nebyly získány — kontroluj API klíče"
-        logger.error(msg)
-        results["errors"].append(msg)
-        return results
+    forecasts_for_summary: list[WeatherForecast] = []
 
-    # --- 2. Pro každou předpověď najdi Polymarket kontrakt a nakup ---
-    for forecast in forecasts:
+    for city_cfg in CITIES:
+        # --- 1. Časová kontrola (PŘED voláním API) ---
+        in_window, target_date = _is_in_buy_window(city_cfg, now_utc)
+        local_now = _city_local_now(city_cfg)
+
+        if not in_window:
+            logger.debug(
+                "⏩ %s: mimo okno (lokálně %s, okno od %02d:00)",
+                city_cfg.name, local_now.strftime("%H:%M"), 24 - BUY_HOURS_BEFORE,
+            )
+            results["cities_outside_window"] += 1
+            continue
+
+        # --- 2. Duplicate check (PŘED voláním API) ---
+        if (city_cfg.name, target_date.isoformat()) in open_positions:
+            logger.info(
+                "⏭️  %s: pozice pro %s již existuje, přeskakuji",
+                city_cfg.name, target_date,
+            )
+            results["positions_skipped"] += 1
+            results["trades"].append({
+                "city": city_cfg.name,
+                "action": "SKIPPED",
+                "reason": "duplicate",
+                "target_date": target_date.isoformat(),
+                "local_time": local_now.strftime("%H:%M %Z"),
+            })
+            continue
+
+        logger.info(
+            "✅ %s: v okně (lokálně %s) → target %s",
+            city_cfg.name, local_now.strftime("%H:%M %Z"), target_date,
+        )
+
+        # --- 3. Forecast (teprve teď voláme API) ---
         try:
-            result = _process_forecast(forecast, gamma, ledger, tomorrow)
-            if result:
-                results["trades"].append(result)
-                if result["action"] == "OPENED":
+            forecast = collector.get_forecast(city_cfg.name, target_date)
+        except Exception as exc:
+            error_msg = f"Chyba předpovědi {city_cfg.name}: {exc}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+            continue
+
+        if not forecast:
+            results["trades"].append({
+                "city": city_cfg.name,
+                "action": "NO_FORECAST",
+                "target_date": target_date.isoformat(),
+            })
+            continue
+
+        forecasts_for_summary.append(forecast)
+        results["forecasts_fetched"] += 1
+
+        # --- 4. Najdi trh a nakup ---
+        try:
+            trade_result = _process_forecast(forecast, gamma, ledger, target_date)
+            if trade_result:
+                results["trades"].append(trade_result)
+                if trade_result["action"] == "OPENED":
                     results["markets_found"] += 1
                     results["positions_opened"] += 1
-                elif result["action"] == "SKIPPED":
+                elif trade_result["action"] == "SKIPPED":
                     results["positions_skipped"] += 1
-                elif result["action"] == "NO_MARKET":
-                    pass  # Trh nenalezen, ok
         except Exception as exc:
-            error_msg = f"Chyba pro {forecast.city}: {exc}"
+            error_msg = f"Chyba obchodování {city_cfg.name}: {exc}"
             logger.error(error_msg, exc_info=True)
             results["errors"].append(error_msg)
 
-    # --- 3. Aktualizuj finální stats ---
     results["portfolio_balance"] = round(ledger.portfolio.balance, 2)
-
-    # --- 4. Vypíš human-readable summary (pro OpenClaw output) ---
-    _print_summary(results, forecasts)
-
+    _print_summary(results, forecasts_for_summary, now_utc)
     return results
 
 
@@ -122,16 +214,13 @@ def _process_forecast(
     ledger: PaperLedger,
     target_date: date,
 ) -> dict | None:
-    """Zpracuje jednu předpověď — najde trh a otevře pozici."""
-
-    # Najdi Polymarket trh
-    from weather_api import CITY_MAP
+    """Najde Polymarket kontrakt a otevře pozici."""
     city_cfg = CITY_MAP.get(forecast.city)
     polymarket_name = city_cfg.polymarket_name if city_cfg else forecast.city.lower().replace(" ", "-")
 
     logger.info(
         "Hledám trh: %s | předpověď %.1f°%s",
-        forecast.city, forecast.predicted_high, forecast.unit
+        forecast.city, forecast.predicted_high, forecast.unit,
     )
 
     market = gamma.find_weather_market(
@@ -161,7 +250,6 @@ def _process_forecast(
         market.last_trade_price,
     )
 
-    # entry_price = outcomePrices[0] (YES cena)
     entry_price = market.yes_price
     if entry_price <= 0.02 or entry_price >= 0.98:
         reason = f"entry_price mimo rozsah: {entry_price:.4f}"
@@ -176,12 +264,11 @@ def _process_forecast(
             "reason": reason,
         }
 
-    # Edge filter: vstoupit pouze pokud máme dostatečný edge
+    # Edge filter
     threshold: Optional[float] = None
     direction: str = "unknown"
-    threshold, direction = extract_market_info(
-        market.market_slug, market.question, forecast.unit
-    )
+    threshold, direction = extract_market_info(market.market_slug, market.question, forecast.unit)
+
     if threshold is not None:
         edge_result = check_edge(forecast, threshold, direction, entry_price)
         if not edge_result.passes:
@@ -197,7 +284,7 @@ def _process_forecast(
                 "reason": f"edge_filter: {edge_result.reason}",
             }
     else:
-        logger.debug("  Edge: práh nelze určit pro %s, pokračuji bez filtru", market.market_slug)
+        logger.debug("  Edge: práh nelze určit pro %s", market.market_slug)
 
     # Otevři pozici
     trade = ledger.open_position(
@@ -221,14 +308,10 @@ def _process_forecast(
             "reason": "ledger_rejected",
         }
 
-    # Edge pro logování
-    edge_info = {}
+    edge_info: dict = {}
     if threshold is not None:
-        edge_result = compute_edge(forecast, threshold, direction, entry_price)
-        edge_info = {
-            "our_probability": round(edge_result.our_probability, 3),
-            "edge": round(edge_result.edge, 3),
-        }
+        er = compute_edge(forecast, threshold, direction, entry_price)
+        edge_info = {"our_probability": round(er.our_probability, 3), "edge": round(er.edge, 3)}
 
     return {
         "city": forecast.city,
@@ -243,45 +326,62 @@ def _process_forecast(
     }
 
 
-def _print_summary(results: dict, forecasts: list[WeatherForecast]) -> None:
-    """Vypíše summary ve formátu čitelném pro OpenClaw."""
-    print("\n" + "="*60)
-    print(f"🌡️  POLYMARKET WEATHER BOT — DENNÍ NÁKUP")
-    print(f"📅 Target date: {results['target_date']}")
-    print(f"⏰ Spuštěno: {results['run_at']}")
-    print("="*60)
+# ---------------------------------------------------------------------------
+# Výpis
+# ---------------------------------------------------------------------------
 
-    print(f"\n📊 PŘEDPOVĚDI POČASÍ ({results['forecasts_fetched']} měst):")
-    for fc in forecasts:
-        sigma_str = f" σ={fc.std_dev:.1f}°" if fc.std_dev > 0 else ""
-        vals_str = ""
-        if fc.ensemble_values:
-            vals_str = " [" + ", ".join(f"{s}={v:.0f}" for s, v in
-                       zip(fc.ensemble_sources, fc.ensemble_values)) + "]"
-        print(f"   {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}{sigma_str}  [{fc.source}]{vals_str}")
+def _print_summary(results: dict, forecasts: list[WeatherForecast],
+                   now_utc: datetime) -> None:
+    print("\n" + "="*62)
+    print(f"🌡️  POLYMARKET WEATHER BOT — NÁKUPNÍ KONTROLA")
+    print(f"⏰ UTC: {now_utc.strftime('%Y-%m-%d %H:%M')} | okno: posledních {results['buy_hours_before']}h před půlnocí")
+    print("="*62)
 
-    print(f"\n💰 OBCHODOVÁNÍ:")
-    print(f"   Nalezeno trhů:     {results['markets_found']}")
+    if results["cities_outside_window"]:
+        print(f"\n⏩ Mimo okno: {results['cities_outside_window']} měst (API nevoláno)")
+
+    if forecasts:
+        print(f"\n📊 PŘEDPOVĚDI ({results['forecasts_fetched']} měst v okně):")
+        for fc in forecasts:
+            sigma_str = f" σ={fc.std_dev:.1f}°" if fc.std_dev > 0 else ""
+            vals_str = ""
+            if fc.ensemble_values:
+                vals_str = " [" + ", ".join(
+                    f"{s}={v:.0f}" for s, v in zip(fc.ensemble_sources, fc.ensemble_values)
+                ) + "]"
+            print(f"   {fc.city:12s} → {fc.predicted_high:5.1f}°{fc.unit}{sigma_str}  [{fc.source}]{vals_str}")
+
+    print(f"\n💰 VÝSLEDEK:")
     print(f"   Otevřeno pozic:    {results['positions_opened']}")
     print(f"   Přeskočeno:        {results['positions_skipped']}")
 
-    if results["trades"]:
-        print(f"\n📝 DETAILY OBCHODŮ:")
-        for t in results["trades"]:
-            icon = "✅" if t["action"] == "OPENED" else ("⏭️" if t["action"] == "SKIPPED" else "❌")
-            price_str = f" @ {t.get('entry_price', 0):.3f}" if "entry_price" in t else ""
-            reason_str = f" ({t.get('reason', '')})" if t["action"] != "OPENED" else ""
-            print(f"   {icon} {t['city']:12s} {t.get('predicted_temp', '?'):.1f}°{t.get('unit','?')}{price_str}{reason_str}")
+    opened = [t for t in results["trades"] if t["action"] == "OPENED"]
+    skipped = [t for t in results["trades"] if t["action"] == "SKIPPED"]
+    no_market = [t for t in results["trades"] if t["action"] == "NO_MARKET"]
 
-    print(f"\n💼 PORTFOLIO:")
-    print(f"   Balance:           ${results['portfolio_balance']:.2f}")
+    if opened:
+        print(f"\n📝 OTEVŘENÉ POZICE:")
+        for t in opened:
+            edge_str = f" (P={t.get('our_probability',0):.0%} edge={t.get('edge',0):+.0%})" if "edge" in t else ""
+            print(f"   ✅ {t['city']:12s} {t.get('predicted_temp','?'):.1f}°{t.get('unit','?')}"
+                  f" @ {t.get('entry_price',0):.3f}{edge_str}")
+
+    if skipped:
+        print(f"\n⏭️  PŘESKOČENO:")
+        for t in skipped:
+            print(f"   {t['city']:12s} {t.get('reason','')[:50]}")
+
+    if no_market:
+        print(f"\n❌ TRH NENALEZEN: {', '.join(t['city'] for t in no_market)}")
+
+    print(f"\n💼 Balance: ${results['portfolio_balance']:.2f}")
 
     if results["errors"]:
         print(f"\n⚠️  CHYBY ({len(results['errors'])}):")
         for err in results["errors"]:
             print(f"   • {err}")
 
-    print("="*60 + "\n")
+    print("="*62 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +390,8 @@ def _print_summary(results: dict, forecasts: list[WeatherForecast]) -> None:
 
 if __name__ == "__main__":
     result = run_daily_buy()
-
-    # Výstup jako JSON pro případné zpracování OpenClaw agentem
-    output_file = LOG_DIR / f"daily_buy_{date.today().isoformat()}.json"
+    output_file = LOG_DIR / f"daily_buy_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    logger.info("Výsledky uloženy do: %s", output_file)
-
-    # Exit code
+    logger.info("Výsledky uloženy: %s", output_file)
     sys.exit(0 if not result["errors"] else 1)

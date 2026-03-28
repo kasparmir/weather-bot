@@ -22,6 +22,10 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Velikost pozice — musí odpovídat POSITION_SIZE v ledger.py
+# Čteme z env, fallback na výchozí $4
+POSITION_SIZE = float(os.getenv("POSITION_SIZE", "4.0"))
+
 # ---------------------------------------------------------------------------
 # Konfigurace stránky
 # ---------------------------------------------------------------------------
@@ -171,9 +175,9 @@ def render_open_positions(df: pd.DataFrame) -> None:
         st.info("Žádné otevřené pozice.")
         return
 
-    # Výpočet live P&L
+    # Výpočet live P&L — používá POSITION_SIZE z env (výchozí $4)
     open_df["unrealized_pnl"] = (
-        (open_df["current_price"] / open_df["entry_price"] - 1) * 10
+        (open_df["current_price"] / open_df["entry_price"] - 1) * POSITION_SIZE
     ).round(4)
     open_df["unrealized_pnl_pct"] = (
         (open_df["current_price"] / open_df["entry_price"] - 1) * 100

@@ -9,7 +9,7 @@ Spuštění:
 
 Chování:
   - každé 2 minuty  → monitor_positions.py
-  - denně v 18:00 UTC → daily_buy.py
+  - každou hodinu → daily_buy.py (kupuje jen v okně dle timezone)
   - neustále        → streamlit dashboard (volitelné)
 
 Ukončení: Ctrl+C
@@ -35,8 +35,8 @@ SCRIPTS_DIR = BOT_DIR / "scripts"
 LOG_DIR     = BOT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-MONITOR_INTERVAL_SEC = 120          # 2 minuty
-DAILY_BUY_HOUR_UTC   = 18           # 18:00 UTC
+MONITOR_INTERVAL_SEC   = 120        # 2 minuty
+DAILY_BUY_INTERVAL_SEC = 3600       # každou hodinu
 FORECAST_RECHECK_INTERVAL_SEC = 3 * 3600   # každé 3 hodiny
 DASHBOARD_PORT       = 8501
 
@@ -60,7 +60,7 @@ log = logging.getLogger("runner")
 # Stav
 # ---------------------------------------------------------------------------
 _dashboard_proc: subprocess.Popen | None = None
-_last_daily_buy_date: date | None = None
+_last_daily_buy: float = 0.0         # monotonic timestamp
 _last_forecast_recheck: float = 0.0  # monotonic timestamp
 _running = True
 
@@ -157,19 +157,14 @@ def stop_dashboard() -> None:
 # Plánovač
 # ---------------------------------------------------------------------------
 
-def should_run_daily_buy() -> bool:
-    """True pokud je 18:00 UTC a dnes jsme ještě nespustili daily_buy."""
-    global _last_daily_buy_date
-    now = _now_utc()
-    today = now.date()
-    if now.hour == DAILY_BUY_HOUR_UTC and _last_daily_buy_date != today:
-        return True
-    return False
+def should_run_daily_buy(now_mono: float) -> bool:
+    """True pokud uběhla hodina od posledního nákupního běhu."""
+    return (now_mono - _last_daily_buy) >= DAILY_BUY_INTERVAL_SEC
 
 
 def mark_daily_buy_done() -> None:
-    global _last_daily_buy_date
-    _last_daily_buy_date = _now_utc().date()
+    global _last_daily_buy
+    _last_daily_buy = time.monotonic()
 
 
 def mark_forecast_recheck_done() -> None:
@@ -211,7 +206,7 @@ def main() -> None:
     log.info("Polymarket Weather Bot — Runner")
     log.info("  Monitor:    každé %d s", MONITOR_INTERVAL_SEC)
     log.info("  Fcst recheck: každé %d h", FORECAST_RECHECK_INTERVAL_SEC // 3600)
-    log.info("  Daily buy:  každý den v %02d:00 UTC", DAILY_BUY_HOUR_UTC)
+    log.info("  Daily buy:  každou hodinu (okno dle BUY_HOURS_BEFORE)")
     log.info("  Dashboard:  %s", f"http://localhost:{args.port}" if not args.no_dashboard else "vypnuto")
     log.info("  Ukončení:   Ctrl+C")
     log.info("=" * 60)
@@ -247,7 +242,7 @@ def main() -> None:
             mark_forecast_recheck_done()
 
         # --- Daily buy (18:00 UTC) ---
-        if should_run_daily_buy():
+        if should_run_daily_buy(now_mono):
             run_script("daily_buy.py", "daily_buy")
             mark_daily_buy_done()
 
