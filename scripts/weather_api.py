@@ -81,18 +81,33 @@ CITY_MAP: dict[str, CityConfig] = {c.name: c for c in CITIES}
 def _resolve_provider(city: CityConfig) -> list[str]:
     """
     Vrátí seřazený seznam providerů pro město.
-    Priorita: per-město env > globální USA env > default z CityConfig.
+
+    Priorita (od nejvyšší):
+      1. Per-město env:   WEATHER_PROVIDER_NEW_YORK=openmeteo
+      2. Globální region: USA_WEATHER_PROVIDER=noaa,openmeteo
+                          EU_WEATHER_PROVIDER=yr,openmeteo
+      3. Default z CityConfig (noaa pro US, yr pro EU)
     """
+    def _parse(val: str) -> list[str]:
+        return [p.strip() for p in val.strip().lower().split(",") if p.strip()]
+
+    # 1. Per-město
     env_key = "WEATHER_PROVIDER_" + city.name.upper().replace(" ", "_")
-    per_city = os.getenv(env_key, "").strip().lower()
+    per_city = os.getenv(env_key, "")
     if per_city:
-        return [p.strip() for p in per_city.split(",") if p.strip()]
+        return _parse(per_city)
 
+    # 2. Regionální
     if city.country == "US":
-        global_usa = os.getenv("USA_WEATHER_PROVIDER", "").strip().lower()
+        global_usa = os.getenv("USA_WEATHER_PROVIDER", "")
         if global_usa:
-            return [p.strip() for p in global_usa.split(",") if p.strip()]
+            return _parse(global_usa)
+    else:
+        global_eu = os.getenv("EU_WEATHER_PROVIDER", "")
+        if global_eu:
+            return _parse(global_eu)
 
+    # 3. Default z CityConfig
     return [city.api_source.lower()]
 
 
