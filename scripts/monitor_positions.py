@@ -42,12 +42,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("monitor")
 
-# Profit take threshold (lze přepsat env proměnnou)
-PROFIT_THRESHOLD = float(os.getenv("PROFIT_TAKE_THRESHOLD", "0.50"))
+# Profit take — dvě podmínky (splnění JEDNÉ stačí pro prodej):
+#   A) Absolutní tržní cena YES >= PROFIT_THRESHOLD (výchozí: 0.50)
+#   B) Nerealizovaný P&L >= PROFIT_TAKE_ABS dolarů (výchozí: $0.50)
+#      nebo >= PROFIT_TAKE_PCT procent (výchozí: 50%)
+# Nastavení 0 = podmínka vypnuta
+PROFIT_THRESHOLD  = float(os.getenv("PROFIT_TAKE_THRESHOLD",  "0.50"))  # YES cena
+PROFIT_TAKE_ABS   = float(os.getenv("PROFIT_TAKE_ABS",        "0.50"))  # absolutní $ zisk
+PROFIT_TAKE_PCT   = float(os.getenv("PROFIT_TAKE_PCT",        "0.50"))  # % zisk od entry
 # Stop-loss: prodej pokud ztráta přesáhne X % z entry (default 70 %)
 # Příklad: entry=0.40, stop_loss=0.70 → prodej pokud cena klesne pod 0.40*(1-0.70)=0.12
-# Nastavení: STOP_LOSS_THRESHOLD=0.50 (50%), 0=vypnuto
-STOP_LOSS_THRESHOLD = float(os.getenv("STOP_LOSS_THRESHOLD", "0.70"))
+# Nastavení: STOP_LOSS_THRESHOLD=0.50 (50%), 0=vypnuto  (výchozí: 0.60 = 60%)
+STOP_LOSS_THRESHOLD = float(os.getenv("STOP_LOSS_THRESHOLD", "0.60"))
 # Minimální nárůst ceny pro zaznamenanou změnu (potlačení šumu)
 PRICE_CHANGE_LOG_MIN = float(os.getenv("PRICE_CHANGE_LOG_MIN", "0.005"))
 
@@ -204,24 +210,56 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
                     current_price, min_exit, PROFIT_TAKE_PCT * 100, remaining,
                 )
         else:
-            # Normální podmínka: cena >= 0.50 A >= entry+5 %
-            min_exit = max(PROFIT_THRESHOLD, trade.entry_price * 1.05)
-            if current_price >= min_exit:
+            # Normální podmínky — splnění JEDNÉ stačí:
+            #   A) YES cena >= PROFIT_THRESHOLD (výchozí 0.50) A >= entry+5%
+            #   B) Nerealizovaný P&L >= PROFIT_TAKE_ABS dolarů
+            #   C) Nerealizovaný P&L >= PROFIT_TAKE_PCT procent
+
+            from ledger import POSITION_SIZE as _POSITION_SIZE
+            unrealized_pnl_dollar = _POSITION_SIZE * (current_price / trade.entry_price - 1)
+            unrealized_pnl_pct    = (current_price / trade.entry_price - 1) * 100
+
+            # Podmínka A: cena
+            price_condition = (
+                PROFIT_THRESHOLD > 0
+                and current_price >= max(PROFIT_THRESHOLD, trade.entry_price * 1.05)
+            )
+            # Podmínka B: absolutní $ zisk
+            abs_condition = (
+                PROFIT_TAKE_ABS > 0
+                and unrealized_pnl_dollar >= PROFIT_TAKE_ABS
+            )
+            # Podmínka C: procentuální zisk
+            pct_condition = (
+                PROFIT_TAKE_PCT > 0
+                and unrealized_pnl_pct >= PROFIT_TAKE_PCT * 100
+            )
+
+            if price_condition or abs_condition or pct_condition:
+                trigger = (
+                    f"price≥{PROFIT_THRESHOLD}" if price_condition else
+                    f"abs_pnl≥${PROFIT_TAKE_ABS:.2f}" if abs_condition else
+                    f"pnl_pct≥{PROFIT_TAKE_PCT:.0%}"
+                )
                 logger.info(
-                    "  🎯 PROFIT TAKE: %.4f >= %.2f (entry=%.4f +5%%) | Zahajuji prodej",
-                    current_price, min_exit, trade.entry_price,
+                    "  🎯 PROFIT TAKE [%s]: cena=%.4f | P&L=$%.2f (+%.1f%%)",
+                    trigger, current_price, unrealized_pnl_dollar, unrealized_pnl_pct,
                 )
                 closed_trade = ledger.close_position(
                     trade_id=trade.id,
                     exit_price=current_price,
                     reason="CLOSED_PROFIT",
-                    notes=f"profit-take: {current_price:.4f} >= {min_exit:.4f} (threshold={PROFIT_THRESHOLD}, entry={trade.entry_price:.4f})",
+                    notes=(
+                        f"profit-take [{trigger}]: cena={current_price:.4f} "
+                        f"pnl=${unrealized_pnl_dollar:.2f} ({unrealized_pnl_pct:.1f}%) "
+                        f"entry={trade.entry_price:.4f}"
+                    ),
                 )
                 return {
                     "trade_id": trade.id,
                     "city": trade.city,
                     "action": "PROFIT_TAKE",
-                    "mode": "normal",
+                    "mode": f"normal[{trigger}]",
                     "entry_price": trade.entry_price,
                     "exit_price": current_price,
                     "pnl": closed_trade.pnl if closed_trade else 0,

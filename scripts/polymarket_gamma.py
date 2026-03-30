@@ -68,20 +68,54 @@ class PolymarketGamma:
 
     def find_weather_market(self, city_polymarket_name: str, target_date: date,
                             predicted_temp: float, unit: str) -> Optional[WeatherMarket]:
-        m = self._strategy_event_slug(city_polymarket_name, target_date, predicted_temp, unit)
-        if m:
-            return m
-        m = self._strategy_market_slug(city_polymarket_name, target_date, predicted_temp, unit)
-        if m:
-            return m
-        m = self._strategy_tag_filter(city_polymarket_name, target_date, predicted_temp, unit)
-        if m:
-            return m
-        m = self._strategy_events_scan(city_polymarket_name, target_date, predicted_temp, unit)
-        if m:
+        strategies = [
+            lambda: self._strategy_event_slug(city_polymarket_name, target_date, predicted_temp, unit),
+            lambda: self._strategy_market_slug(city_polymarket_name, target_date, predicted_temp, unit),
+            lambda: self._strategy_tag_filter(city_polymarket_name, target_date, predicted_temp, unit),
+            lambda: self._strategy_events_scan(city_polymarket_name, target_date, predicted_temp, unit),
+        ]
+        for strategy in strategies:
+            m = strategy()
+            if not m:
+                continue
+            if not self._validate_market_date(m, target_date):
+                logger.warning(
+                    "✗ Market odmítnut — datum nesedí: end_date='%s' target=%s (%s)",
+                    m.end_date, target_date, m.market_slug,
+                )
+                continue
             return m
         logger.warning("✗ Trh nenalezen: %s %s", city_polymarket_name, target_date)
         return None
+
+    def _validate_market_date(self, market: "WeatherMarket", target_date: date) -> bool:
+        """
+        Ověří, že market settlement date odpovídá target_date (±1 den tolerance
+        kvůli timezone offset UTC vs lokální čas).
+
+        Polymarket end_date formáty: "2026-03-27T23:59:00Z", "2026-03-27T00:00:00Z"
+        Pokud end_date chybí nebo nejde parsovat → přijmeme (benefit of doubt).
+        """
+        end_raw = (market.end_date or "").strip()
+        if not end_raw:
+            return True
+
+        try:
+            market_date = date.fromisoformat(end_raw[:10])
+        except (ValueError, TypeError):
+            logger.debug("_validate_market_date: nelze parsovat end_date '%s'", end_raw)
+            return True
+
+        diff = abs((market_date - target_date).days)
+        if diff > 1:
+            logger.warning(
+                "  Date mismatch: market_date=%s, target=%s, Δ=%d dní — odmítám",
+                market_date, target_date, diff,
+            )
+            return False
+
+        logger.debug("  Date OK: market_date=%s, target=%s", market_date, target_date)
+        return True
 
     def get_market_price(self, market_slug: str) -> Optional[WeatherMarket]:
         return self._fetch_market_by_slug(market_slug)
@@ -300,15 +334,22 @@ class PolymarketGamma:
                 continue
 
             score = 10 if has_city else 0
+            date_found = False
             for ds in date_strs:
                 if ds in combined:
                     score += 8
+                    date_found = True
                     break
             if month_str in combined:
                 score += 3
             for kw in ["temperature", "highest", "daily high"]:
                 if kw in combined:
                     score += 2
+
+            # Penalizace pokud datum není v event slug/title
+            # (bude ověřeno přes end_date validaci, ale preferujeme explicitní datum)
+            if not date_found:
+                score -= 5
 
             if score > best_score:
                 eslug = str(event.get("slug", ""))
