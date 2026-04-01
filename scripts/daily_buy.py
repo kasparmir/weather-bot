@@ -75,23 +75,38 @@ def _is_in_buy_window(city: CityConfig, now_utc: datetime) -> tuple[bool, date |
     """
     Zkontroluje, zda jsme v nákupním okně pro dané město.
 
-    Okno: posledních BUY_HOURS_BEFORE hodin před půlnocí.
-    Příklad (BUY_HOURS_BEFORE=4): 20:00–23:59 lokálně.
+    Logika: "kup BUY_HOURS_BEFORE hodin před 00:00 cílového dne"
+    Target = den jehož 00:00 (půlnoc) je do BUY_HOURS_BEFORE hodin od teď.
 
-    Vrací (True, target_date) nebo (False, None).
-    target_date = zítřek v lokálním čase města.
+    Příklad (BUY_HOURS_BEFORE=4):
+      22:30 lokálně → do půlnoci 1.5 h < 4 h → v okně, target = zítřek
+      19:45 lokálně → do půlnoci 4.25 h > 4 h → mimo okno
+
+    Výpočet v sekundách (přesný, nezávislý na DST).
     """
+    from datetime import time as dtime
     local_now = now_utc.astimezone(ZoneInfo(city.timezone))
-    local_hour = local_now.hour  # 0–23
 
-    # Okno: od (24 - BUY_HOURS_BEFORE) do 23:59
-    window_start = 24 - BUY_HOURS_BEFORE  # např. 20 pro BUY_HOURS_BEFORE=4
+    # Přesný čas příští půlnoci v lokálním čase
+    midnight = datetime.combine(
+        local_now.date() + timedelta(days=1),
+        dtime(0, 0, 0),
+        tzinfo=ZoneInfo(city.timezone),
+    )
+    hours_until_midnight = (midnight - local_now).total_seconds() / 3600.0
 
-    if local_hour >= window_start:
-        # Jsme v okně → target = zítřek v lokálním čase
-        target = local_now.date() + timedelta(days=1)
+    if hours_until_midnight <= BUY_HOURS_BEFORE:
+        target = midnight.date()  # den jehož 00:00 nastane do BUY_HOURS_BEFORE hodin
+        logger.debug(
+            "%s: do půlnoci %.2f h <= %d h → v okně, target=%s",
+            city.name, hours_until_midnight, BUY_HOURS_BEFORE, target,
+        )
         return True, target
 
+    logger.debug(
+        "%s: do půlnoci %.2f h > %d h → mimo okno",
+        city.name, hours_until_midnight, BUY_HOURS_BEFORE,
+    )
     return False, None
 
 
@@ -106,8 +121,8 @@ def run_daily_buy() -> dict:
     """
     now_utc = datetime.now(timezone.utc)
     logger.info("=== NÁKUPNÍ KONTROLA === %s UTC", now_utc.strftime("%Y-%m-%d %H:%M"))
-    logger.info("BUY_HOURS_BEFORE=%d (okno %02d:00–23:59 lokálně)",
-                BUY_HOURS_BEFORE, 24 - BUY_HOURS_BEFORE)
+    logger.info("BUY_HOURS_BEFORE=%d (nakupuje pokud do půlnoci <= %d h lokálně)",
+                BUY_HOURS_BEFORE, BUY_HOURS_BEFORE)
 
     collector = WeatherCollector(meteoblue_api_key=os.getenv("METEOBLUE_API_KEY", ""))
     gamma = PolymarketGamma()

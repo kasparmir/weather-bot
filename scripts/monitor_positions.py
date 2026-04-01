@@ -211,7 +211,8 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
                 )
         else:
             # Normální podmínky — splnění JEDNÉ stačí:
-            #   A) YES cena >= PROFIT_THRESHOLD (výchozí 0.50) A >= entry+5%
+            #   A) YES cena >= PROFIT_THRESHOLD (výchozí 0.50) A >= entry+20%
+            #      (20% ochrana: při entry=0.40 prodej jen pokud cena >= 0.50 AND >= 0.48)
             #   B) Nerealizovaný P&L >= PROFIT_TAKE_ABS dolarů
             #   C) Nerealizovaný P&L >= PROFIT_TAKE_PCT procent
 
@@ -219,10 +220,12 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
             unrealized_pnl_dollar = _POSITION_SIZE * (current_price / trade.entry_price - 1)
             unrealized_pnl_pct    = (current_price / trade.entry_price - 1) * 100
 
-            # Podmínka A: cena
+            # Podmínka A: cena >= PROFIT_THRESHOLD A zároveň >= entry + 20 %
+            # Ochrana: zabrání prodeji hned jak cena přesáhne 0.50 při entry 0.48
             price_condition = (
                 PROFIT_THRESHOLD > 0
-                and current_price >= max(PROFIT_THRESHOLD, trade.entry_price * 1.05)
+                and current_price >= PROFIT_THRESHOLD
+                and current_price >= trade.entry_price * 1.20
             )
             # Podmínka B: absolutní $ zisk
             abs_condition = (
