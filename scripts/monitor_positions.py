@@ -138,18 +138,46 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
 
         # Kontrola: trh uzavřen → settlement
         if market.closed or not market.active:
-            logger.info("  → Trh uzavřen, settlement @ %.4f", market.yes_price)
+            yes_price = market.yes_price
+
+            # Čekej na skutečnou výplatu: Polymarket resolvuje na 1.0 (YES vyhrál)
+            # nebo 0.0 (NO vyhrál). Pokud je cena stále v šedé zóně (0.05–0.95),
+            # trh ještě nebyl definitivně vyřešen — počkej na příští kontrolu.
+            if 0.05 < yes_price < 0.95:
+                logger.info(
+                    "  ⏳ Trh uzavřen ale čeká na resolution: yes_price=%.4f (šedá zóna)",
+                    yes_price,
+                )
+                # Aktualizuj cenu ale nuzavírej
+                ledger.update_position_price(trade.id, yes_price)
+                return {
+                    "trade_id": trade.id,
+                    "city": trade.city,
+                    "action": "PRICE_UPDATED",
+                    "prev_price": trade.current_price,
+                    "current_price": yes_price,
+                    "distance_to_target": round(PROFIT_THRESHOLD - yes_price, 4),
+                    "forecast_diverged": trade.forecast_diverged,
+                    "note": "awaiting_resolution",
+                }
+
+            # Cena je blízko 0 nebo 1 → definitivní výsledek
+            logger.info(
+                "  → Trh vyřešen: yes_price=%.4f (%s) | settlement",
+                yes_price, "YES" if yes_price >= 0.95 else "NO",
+            )
             settled_trade = ledger.close_position(
                 trade_id=trade.id,
-                exit_price=market.yes_price,
+                exit_price=yes_price,
                 reason="CLOSED_SETTLEMENT",
-                notes="auto-settlement: trh uzavřen",
+                notes=f"settlement: {'YES' if yes_price >= 0.95 else 'NO'} @ {yes_price:.4f}",
             )
             return {
                 "trade_id": trade.id,
                 "city": trade.city,
                 "action": "SETTLEMENT",
-                "exit_price": market.yes_price,
+                "exit_price": yes_price,
+                "result": "YES" if yes_price >= 0.95 else "NO",
                 "pnl": settled_trade.pnl if settled_trade else 0,
             }
 

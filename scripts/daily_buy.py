@@ -141,10 +141,12 @@ def run_daily_buy() -> dict:
         "portfolio_balance": ledger.portfolio.balance,
     }
 
-    # Načti otevřené pozice jednou — pro rychlou duplicate check
-    open_positions = {
+    # Pro duplicate check načteme VŠECHNY trades (open i closed) pro dnešní target dates.
+    # Důvod: po uzavření pozice (settlement/profit-take) nechceme hned rebuyovat
+    # stejný market ve stejném nákupním cyklu.
+    all_trades_today = {
         (t.city, t.target_date)
-        for t in ledger.get_open_trades()
+        for t in ledger.get_all_trades()
     }
 
     forecasts_for_summary: list[WeatherForecast] = []
@@ -163,7 +165,7 @@ def run_daily_buy() -> dict:
             continue
 
         # --- 2. Duplicate check (PŘED voláním API) ---
-        if (city_cfg.name, target_date.isoformat()) in open_positions:
+        if (city_cfg.name, target_date.isoformat()) in all_trades_today:
             logger.info(
                 "⏭️  %s: pozice pro %s již existuje, přeskakuji",
                 city_cfg.name, target_date,
@@ -266,8 +268,10 @@ def _process_forecast(
     )
 
     entry_price = market.yes_price
-    if entry_price <= 0.02 or entry_price >= 0.98:
-        reason = f"entry_price mimo rozsah: {entry_price:.4f}"
+    # Horní limit 0.85: trhy nad 85% jsou téměř vyřešeny,
+    # žádný smysluplný edge a hrozí koupě při settlement ceně
+    if entry_price <= 0.05 or entry_price >= 0.85:
+        reason = f"entry_price mimo rozsah (0.05–0.85): {entry_price:.4f}"
         logger.info("  → Přeskakuji: %s", reason)
         return {
             "city": forecast.city,
