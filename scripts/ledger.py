@@ -293,10 +293,10 @@ class PaperLedger:
         self.portfolio.open_positions_count = max(0, self.portfolio.open_positions_count - 1)
         self.portfolio.closed_positions_count += 1
         self.portfolio.total_pnl += pnl_dollar
-        if pnl_dollar >= 0:
+        if pnl_dollar > 0:
             self.portfolio.wins += 1
         else:
-            self.portfolio.losses += 1
+            self.portfolio.losses += 1  # zahrnuje i breakeven (pnl=0)
         self.portfolio.last_updated = now_iso
 
         self._update_trade_row(trade)

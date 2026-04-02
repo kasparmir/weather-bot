@@ -140,11 +140,21 @@ def render_sidebar(portfolio: dict) -> None:
 
         st.divider()
 
-        win_rate = portfolio.get("win_rate", 0)
-        wins = portfolio.get("wins", 0)
-        losses = portfolio.get("losses", 0)
-        st.metric("✅ Win rate", f"{win_rate:.1f}%")
-        st.caption(f"Wins: {wins} | Losses: {losses}")
+        # Win rate přepočítáme vždy z CSV — stejná logika jako v tabulce
+        # Zabrání neshodám mezi portfolio.json (může být stale) a CSV
+        try:
+            _df = load_trades()
+            _closed = _df[_df["status"] != "OPEN"] if not _df.empty else _df
+            _wins   = int((_closed["pnl"] > 0).sum())  if not _closed.empty else 0
+            _losses = int((_closed["pnl"] <= 0).sum()) if not _closed.empty else 0
+            _total  = _wins + _losses
+            _wr     = _wins / _total * 100 if _total > 0 else 0.0
+        except Exception:
+            _wins, _losses, _wr = (portfolio.get("wins", 0),
+                                   portfolio.get("losses", 0),
+                                   portfolio.get("win_rate", 0))
+        st.metric("✅ Win rate", f"{_wr:.1f}%")
+        st.caption(f"Wins: {_wins} | Losses: {_losses}")
 
         st.divider()
 
