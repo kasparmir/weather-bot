@@ -169,17 +169,42 @@ class WeatherCollector:
         "Cache-Control": "no-cache",
     }
 
+    # Open-Meteo modely pro globální multi-model ensemble (vše zdarma, bez klíče).
+    # Pořadí dle obecné kvality: ECMWF IFS je world-class, ostatní doplňují.
+    OPENMETEO_MODELS_GLOBAL = [
+        "ecmwf_ifs025",
+        "gfs_seamless",
+        "icon_seamless",
+        "gem_seamless",
+        "jma_seamless",
+        "metno_seamless",
+        "bom_access_global",
+        "cma_grapes_global",
+    ]
+    # Vysokorozlišovací regionální modely pro EU (přidávají se k EU městům)
+    OPENMETEO_MODELS_EU_EXTRA = [
+        "knmi_harmonie_arome_europe",
+        "dmi_harmonie_arome_europe",
+        "meteofrance_arome_france_hd",
+    ]
+
+    # Výchozí ensemble: openmeteo_models (6+ NWP modelů jedním requestem) + NOAA (US) + YR (EU).
+    # NOAA selže silently pro EU města a YR pro US — to je v pořádku, ensemble pokračuje.
+    DEFAULT_ENSEMBLE = ["openmeteo_models", "noaa", "yr"]
+
     def __init__(self, meteoblue_api_key: str | None = None, timeout: int = 20):
         self.meteoblue_api_key = meteoblue_api_key or os.getenv("METEOBLUE_API_KEY", "")
         self.timeout = timeout
         self._noaa_grid_cache: dict[str, dict] = {}
-        # Ensemble: seznam providerů přes env ENSEMBLE_PROVIDERS=noaa,openmeteo
-        # Prázdné = bez ensemble (použij standardní provider chain)
-        self._ensemble_providers = [
-            p.strip().lower()
-            for p in os.getenv("ENSEMBLE_PROVIDERS", "").split(",")
-            if p.strip()
-        ]
+        # Ensemble: env override, jinak default (multi-model). Prázdný řetězec NEVYPÍNÁ ensemble —
+        # k vypnutí použij ENSEMBLE_PROVIDERS=off (nebo 'none').
+        env_val = os.getenv("ENSEMBLE_PROVIDERS", "").strip().lower()
+        if env_val in ("off", "none", "disabled"):
+            self._ensemble_providers: list[str] = []
+        elif env_val:
+            self._ensemble_providers = [p.strip() for p in env_val.split(",") if p.strip()]
+        else:
+            self._ensemble_providers = list(self.DEFAULT_ENSEMBLE)
 
     # ------------------------------------------------------------------
     # Veřejné metody
@@ -240,6 +265,19 @@ class WeatherCollector:
         sources: list[str] = []
 
         for provider in self._ensemble_providers:
+            # Speciální provider: rozbalí se na N modelů jedním Open-Meteo requestem.
+            if provider == "openmeteo_models":
+                try:
+                    model_results = self._fetch_openmeteo_models(city, target_date)
+                    for model_name, temp_in_unit in model_results:
+                        values.append(temp_in_unit)
+                        sources.append(f"OM:{model_name}")
+                        logger.info("Ensemble %s [OM:%s]: %.1f°%s",
+                                    city.name, model_name, temp_in_unit, city.unit)
+                except Exception as exc:
+                    logger.warning("Ensemble %s [openmeteo_models]: %s", city.name, exc)
+                continue
+
             try:
                 fc = self._fetch_by_provider(provider, city, target_date)
                 if fc:
@@ -248,26 +286,37 @@ class WeatherCollector:
                     logger.info("Ensemble %s [%s]: %.1f°%s",
                                 city.name, provider.upper(), fc.predicted_high, city.unit)
             except Exception as exc:
-                logger.warning("Ensemble %s [%s]: %s", city.name, provider.upper(), exc)
+                logger.debug("Ensemble %s [%s]: %s", city.name, provider.upper(), exc)
 
         if not values:
             return None
 
-        # Outlier removal při 3+ zdrojích (median-based + absolutní limit)
-        # 2σ nestačí při malém počtu zdrojů → použijeme medián + pevný práh
-        # Práh: 10°F (≈5.5°C) — předpovědi se reálně nerozcházejí víc
-        if len(values) >= 3:
-            import statistics as _stats
-            med = _stats.median(values)
+        # Outlier removal: IQR-based (1.5×IQR pravidlo), funguje i pro malé vzorky.
+        # Záložní hard-cap: ±10°F / ±5.5°C od mediánu (předpovědi se reálně nerozcházejí víc).
+        if len(values) >= 4:
+            sorted_v = sorted(values)
+            n = len(sorted_v)
+            q1 = sorted_v[n // 4]
+            q3 = sorted_v[(3 * n) // 4]
+            iqr = q3 - q1
+            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            med = statistics.median(values)
+            hard = 10.0 if city.unit == "F" else 5.5
+            filtered = [
+                (v, s) for v, s in zip(values, sources)
+                if lo <= v <= hi and abs(v - med) <= hard
+            ]
+            if len(filtered) >= max(3, len(values) - 2):  # ponecháme aspoň 3, max 2 outliers
+                if len(filtered) < len(values):
+                    logger.info("Ensemble %s: %d outlier(s) odfiltrováno, zbývá %d zdrojů",
+                                city.name, len(values) - len(filtered), len(filtered))
+                values, sources = [v for v, _ in filtered], [s for _, s in filtered]
+        elif len(values) >= 3:
+            med = statistics.median(values)
             max_dev = 10.0 if city.unit == "F" else 5.5
-            filtered = [(v, s) for v, s in zip(values, sources)
-                        if abs(v - med) <= max_dev]
-            if filtered and len(filtered) >= 2:
-                values, sources = zip(*filtered)  # type: ignore
-                values, sources = list(values), list(sources)
-                if len(values) < len(filtered) + 1:  # byl odfiltrován alespoň 1
-                    logger.info("Ensemble %s: outlier odfiltrován, zbývá %d zdrojů",
-                                city.name, len(values))
+            filtered = [(v, s) for v, s in zip(values, sources) if abs(v - med) <= max_dev]
+            if len(filtered) >= 2:
+                values, sources = [v for v, _ in filtered], [s for _, s in filtered]
 
         mean_val = statistics.mean(values)
         std = statistics.stdev(values) if len(values) > 1 else 0.0
@@ -501,6 +550,75 @@ class WeatherCollector:
             raw_celsius=raw_c,
             fetched_at=datetime.now(timezone.utc),
         )
+
+    def _fetch_openmeteo_models(self, city: CityConfig,
+                                 target_date: date) -> list[tuple[str, float]]:
+        """
+        Multi-model ensemble přes Open-Meteo `models=` parametr.
+        Jednou HTTP requestu vrátí denní `temperature_2m_max` pro každý model.
+
+        Modely jsou globální NWP systémy (ECMWF IFS, GFS, ICON, GEM, JMA, MET Norway, ...)
+        — všechny zdarma, bez API klíče. Pro EU města se přidají regionální HD modely.
+
+        Vrací: list (model_name, temperature_in_city_unit) — jen modely s validní hodnotou.
+        """
+        models = list(self.OPENMETEO_MODELS_GLOBAL)
+        if city.country != "US":
+            models += self.OPENMETEO_MODELS_EU_EXTRA
+
+        unit_param = "fahrenheit" if city.unit == "F" else "celsius"
+        params = {
+            "latitude": city.lat,
+            "longitude": city.lon,
+            "daily": "temperature_2m_max",
+            "temperature_unit": unit_param,
+            "timezone": "auto",
+            "forecast_days": 7,
+            "models": ",".join(models),
+        }
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        daily = data.get("daily") or {}
+        days: list[str] = daily.get("time") or []
+        if not days:
+            return []
+
+        try:
+            day_idx = days.index(target_date.isoformat())
+        except ValueError:
+            logger.warning("OM-models: target date %s mimo rozsah pro %s",
+                           target_date, city.name)
+            return []
+
+        results: list[tuple[str, float]] = []
+        for model in models:
+            key = f"temperature_2m_max_{model}"
+            arr = daily.get(key)
+            if not arr or day_idx >= len(arr):
+                continue
+            val = arr[day_idx]
+            if val is None:
+                continue
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            # Hodnota je už v requested unitu (city.unit). Pro °F zaokrouhlíme,
+            # pro °C necháme s 1 desetinou — průměr to vyhladí.
+            if city.unit == "F":
+                fval = float(int(fval + 0.5))
+            results.append((model, fval))
+
+        if not results:
+            logger.warning("OM-models: žádný model nevrátil data pro %s %s",
+                           city.name, target_date)
+        else:
+            logger.info("OM-models %s: %d/%d modelů vrátilo data",
+                        city.name, len(results), len(models))
+        return results
 
     def _wu_parse_daily_high(self, data: dict, target_date: date) -> Optional[float]:
         """

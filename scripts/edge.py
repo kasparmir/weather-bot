@@ -35,11 +35,15 @@ logger = logging.getLogger(__name__)
 # Konfigurace
 # ---------------------------------------------------------------------------
 
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
-# Výchozí směrodatná odchylka předpovědi (nejistota)
-# NOAA 24h forecast: typicky ±3°F / ±1.5°C
-FORECAST_SIGMA_F = float(os.getenv("FORECAST_SIGMA_F", "3.0"))
-FORECAST_SIGMA_C = float(os.getenv("FORECAST_SIGMA_C", "1.5"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.025"))
+# Minimální P(YES), aby vůbec stálo za to vstoupit. Brání nákupu lottery-ticket trhů,
+# kde je "edge" pozitivní jen proto, že trh sám je 1 % a my říkáme 4 %.
+MIN_PROBABILITY = float(os.getenv("MIN_PROBABILITY", "0.30"))
+# Výchozí směrodatná odchylka předpovědi (nejistota) — používá se jako spodní hranice;
+# multi-model ensemble obvykle dodá vlastní (často nižší) sigma.
+# 24h forecast multi-model ensemble: typicky ±1.5–2.5°F / ±0.8–1.4°C
+FORECAST_SIGMA_F = float(os.getenv("FORECAST_SIGMA_F", "2.0"))
+FORECAST_SIGMA_C = float(os.getenv("FORECAST_SIGMA_C", "1.1"))
 # Pokud True, při ensemble použij max(FORECAST_SIGMA, std_dev_ensemble)
 USE_ENSEMBLE_SIGMA = os.getenv("EDGE_ENSEMBLE_SIGMA", "true").lower() != "false"
 
@@ -119,11 +123,14 @@ def compute_edge(
     )
 
     edge = our_prob - market_price
-    passes = edge >= MIN_EDGE
+    passes = edge >= MIN_EDGE and our_prob >= MIN_PROBABILITY
 
     if passes:
         reason = (f"edge {edge*100:+.1f}% >= min {MIN_EDGE*100:.1f}% "
                   f"(P={our_prob*100:.1f}%, tržní={market_price*100:.1f}%)")
+    elif our_prob < MIN_PROBABILITY:
+        reason = (f"P(YES) {our_prob*100:.1f}% < min {MIN_PROBABILITY*100:.0f}% "
+                  f"(edge {edge*100:+.1f}%, tržní={market_price*100:.1f}%)")
     else:
         reason = (f"edge {edge*100:+.1f}% < min {MIN_EDGE*100:.1f}% "
                   f"(P={our_prob*100:.1f}%, tržní={market_price*100:.1f}%)")
