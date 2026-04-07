@@ -57,9 +57,24 @@ logger = logging.getLogger("daily_buy")
 # ---------------------------------------------------------------------------
 # Konfigurace
 # ---------------------------------------------------------------------------
-# Počet hodin před půlnocí místního času kdy se provádí nákup
-# Výchozí: 4 → okno 20:00–23:59 lokálně
-BUY_HOURS_BEFORE = int(os.getenv("BUY_HOURS_BEFORE", "4"))
+# Počet hodin před půlnocí místního času kdy se provádí nákup T+1.
+# Výchozí: 8 → okno 16:00–23:59 lokálně.
+#
+# Proč 8? ECMWF 12Z run vychází ~17–18 UTC. Pro US Eastern = 12–13 EST,
+# pro EU Central = 18–19 CET. Nákup v 16:00 lokálně zachytí trhy dřív,
+# než ostatní bettors stihnou reagovat na nová data, ale naše ensemble
+# je stále přesná (00Z run je max 10h starý → σ jen o ~0.3°F vyšší).
+BUY_HOURS_BEFORE = int(os.getenv("BUY_HOURS_BEFORE", "8"))
+
+# Lookahead nákupy: nakoupit i pro T+2 (pozítří), ale jen při vysoké jistotě.
+# Trhy pro T+2 jsou nejméně eficientní — casual bettors nemyslí tak dopředu.
+# Vypnutí: LOOK_AHEAD_DAYS=1
+LOOK_AHEAD_DAYS      = int(os.getenv("LOOK_AHEAD_DAYS", "2"))
+# Pro T+2 vyžadujeme větší edge (market je méně eficientní, ale forecast méně jistý)
+LOOK_AHEAD_MIN_EDGE  = float(os.getenv("LOOK_AHEAD_MIN_EDGE", "0.08"))
+# Maximální ensemble sigma pro T+2 nákup — kupujeme jen „sure thing" situace
+LOOK_AHEAD_MAX_SIGMA_F = float(os.getenv("LOOK_AHEAD_MAX_SIGMA_F", "2.5"))
+LOOK_AHEAD_MAX_SIGMA_C = float(os.getenv("LOOK_AHEAD_MAX_SIGMA_C", "1.4"))
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +235,101 @@ def run_daily_buy() -> dict:
             logger.error(error_msg, exc_info=True)
             results["errors"].append(error_msg)
 
+    # --- T+2 lookahead nákupy ---
+    # Kupujeme pozítří jen pokud je ensemble sebejistý a edge silný.
+    # Trhy pro T+2 jsou nejméně eficientní — ostatní bettors nemyslí tak dopředu.
+    if LOOK_AHEAD_DAYS >= 2:
+        _run_look_ahead(
+            collector=collector, gamma=gamma, ledger=ledger,
+            now_utc=now_utc, all_trades_today=all_trades_today,
+            results=results, forecasts_for_summary=forecasts_for_summary,
+        )
+
     results["portfolio_balance"] = round(ledger.portfolio.balance, 2)
     _print_summary(results, forecasts_for_summary, now_utc)
     return results
+
+
+def _run_look_ahead(
+    collector: "WeatherCollector",
+    gamma: "PolymarketGamma",
+    ledger: "PaperLedger",
+    now_utc: datetime,
+    all_trades_today: set,
+    results: dict,
+    forecasts_for_summary: list,
+) -> None:
+    """
+    Lookahead nákupy pro T+2 (pozítří).
+
+    Podmínky pro lookahead nákup:
+      1. Pro (city, target_date) ještě neexistuje žádný trade.
+      2. Ensemble sigma <= LOOK_AHEAD_MAX_SIGMA (sebejistá předpověď).
+      3. Edge >= LOOK_AHEAD_MIN_EDGE (silnější požadavek než pro T+1).
+
+    Tyto podmínky zachytí jen „sure thing" situace — např. jasná horká vlna
+    nebo studená fronta — kdy ostatní bettors zatím nereagovali na T+2 forecast.
+    """
+    look_ahead_date = (now_utc.date() + timedelta(days=2))
+    logger.info(
+        "=== LOOKAHEAD T+2 === target=%s | min_edge=%.0f%% | max_σ=%.1f°F/%.1f°C",
+        look_ahead_date, LOOK_AHEAD_MIN_EDGE * 100,
+        LOOK_AHEAD_MAX_SIGMA_F, LOOK_AHEAD_MAX_SIGMA_C,
+    )
+
+    for city_cfg in CITIES:
+        # Duplicate check
+        if (city_cfg.name, look_ahead_date.isoformat()) in all_trades_today:
+            logger.debug("Lookahead %s: pozice pro %s již existuje", city_cfg.name, look_ahead_date)
+            continue
+
+        # Forecast
+        try:
+            forecast = collector.get_forecast(city_cfg.name, look_ahead_date)
+        except Exception as exc:
+            logger.warning("Lookahead %s: forecast chyba: %s", city_cfg.name, exc)
+            continue
+
+        if not forecast:
+            continue
+
+        # Sigma threshold — jen sebejisté předpovědi
+        max_sigma = LOOK_AHEAD_MAX_SIGMA_F if forecast.unit == "F" else LOOK_AHEAD_MAX_SIGMA_C
+        actual_sigma = forecast.std_dev if forecast.std_dev > 0 else max_sigma + 1
+        if actual_sigma > max_sigma:
+            logger.debug(
+                "Lookahead %s: σ=%.2f°%s > max %.1f°%s → přeskočeno (nejistý forecast)",
+                city_cfg.name, actual_sigma, forecast.unit, max_sigma, forecast.unit,
+            )
+            continue
+
+        logger.info(
+            "Lookahead %s: σ=%.2f°%s <= %.1f → zkouším T+2 trh",
+            city_cfg.name, actual_sigma, forecast.unit, max_sigma,
+        )
+        forecasts_for_summary.append(forecast)
+        results["forecasts_fetched"] += 1
+
+        try:
+            trade_result = _process_forecast(
+                forecast, gamma, ledger, look_ahead_date,
+                min_edge_override=LOOK_AHEAD_MIN_EDGE,
+            )
+            if trade_result:
+                # Označit jako lookahead v logu
+                trade_result["lookahead"] = True
+                trade_result["days_ahead"] = 2
+                results["trades"].append(trade_result)
+                if trade_result["action"] == "OPENED":
+                    results["markets_found"] += 1
+                    results["positions_opened"] += 1
+                    # Přidej do sady pro case že by se lookahead spustil víckrát
+                    all_trades_today.add((city_cfg.name, look_ahead_date.isoformat()))
+                elif trade_result["action"] == "SKIPPED":
+                    results["positions_skipped"] += 1
+        except Exception as exc:
+            logger.error("Lookahead %s: chyba obchodování: %s", city_cfg.name, exc, exc_info=True)
+            results["errors"].append(f"Lookahead {city_cfg.name}: {exc}")
 
 
 def _process_forecast(
@@ -230,6 +337,7 @@ def _process_forecast(
     gamma: PolymarketGamma,
     ledger: PaperLedger,
     target_date: date,
+    min_edge_override: float | None = None,
 ) -> dict | None:
     """
     Najde Polymarket kontrakt a otevře pozici.
@@ -285,9 +393,14 @@ def _process_forecast(
 
         if threshold is not None:
             edge_result = check_edge(forecast, threshold, direction, entry_price)
-            if not edge_result.passes:
-                logger.debug("  → Přeskakuji [%s]: %s", market.market_slug, edge_result.reason)
-                skipped_reasons.append(f"{market.market_slug}: edge_filter ({edge_result.reason})")
+            effective_min_edge = min_edge_override if min_edge_override is not None else MIN_EDGE
+            if not edge_result.passes or edge_result.edge < effective_min_edge:
+                reason = edge_result.reason
+                if min_edge_override and edge_result.passes and edge_result.edge < min_edge_override:
+                    reason = (f"lookahead edge {edge_result.edge*100:+.1f}% < "
+                              f"min {min_edge_override*100:.1f}%")
+                logger.debug("  → Přeskakuji [%s]: %s", market.market_slug, reason)
+                skipped_reasons.append(f"{market.market_slug}: edge_filter ({reason})")
                 continue
         else:
             logger.debug("  → Edge: práh nelze určit pro %s, pokračuji", market.market_slug)
