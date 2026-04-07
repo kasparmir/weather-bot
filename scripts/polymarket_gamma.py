@@ -117,6 +117,62 @@ class PolymarketGamma:
         logger.debug("  Date OK: market_date=%s, target=%s", market_date, target_date)
         return True
 
+    def find_all_weather_markets(self, city_polymarket_name: str, target_date: date,
+                                  predicted_temp: float, unit: str) -> list[WeatherMarket]:
+        """
+        Vrátí VŠECHNY validní markety pro dané město a den, seřazené od nejbližšího
+        k předpovědi. Cena 0.05–0.85 a edge filtr se kontrolují v daily_buy.py.
+
+        Výhoda oproti find_weather_market: pokud první market edge filtrem neprojde
+        (např. je příliš levný/drahý), daily_buy.py zkusí další.
+
+        Logika:
+          1. Najdi event (slug strategie jako find_weather_market).
+          2. Z event.markets[] vrať všechny aktivní markety prošlé date validací.
+          3. Seřaď: range markety kde forecast leží uvnitř → pak dle |threshold − forecast|.
+        """
+        event = self._find_event_for_city(city_polymarket_name, target_date)
+        if not event:
+            # Fallback: standardní hledání vrátí max 1 market
+            single = self.find_weather_market(city_polymarket_name, target_date, predicted_temp, unit)
+            return [single] if single else []
+
+        eslug = str(event.get("slug", ""))
+        eid   = str(event.get("id", ""))
+        markets_raw = event.get("markets") or []
+        target = int(predicted_temp + 0.5) if unit.upper() == "C" else predicted_temp
+
+        result: list[WeatherMarket] = []
+        for m_raw in markets_raw:
+            m = self._parse_market(m_raw, eslug, eid)
+            if not m or not m.active or m.closed:
+                continue
+            if not self._validate_market_date(m, target_date):
+                continue
+            result.append(m)
+
+        if not result:
+            return []
+
+        def _sort_key(m: WeatherMarket) -> float:
+            rng = self._extract_range(m.market_slug, unit)
+            if rng and rng[0] <= target <= rng[1]:
+                return -1.0          # range s forecastem uvnitř = absolutní priorita
+            t = self._extract_threshold(m.question, m.market_slug, unit)
+            return abs(t - target) if t is not None else 999.0
+
+        result.sort(key=_sort_key)
+        logger.info("find_all_weather_markets %s %s: %d marketů", city_polymarket_name, target_date, len(result))
+        return result
+
+    def _find_event_for_city(self, city: str, target_date: date) -> Optional[dict]:
+        """Najde event pro město a den pomocí slug strategií (bez výběru konkrétního marketu)."""
+        for slug in self._generate_event_slugs(city, target_date):
+            event = self._fetch_event_by_slug(slug)
+            if event and event.get("markets"):
+                return event
+        return None
+
     def get_market_price(self, market_slug: str) -> Optional[WeatherMarket]:
         return self._fetch_market_by_slug(market_slug)
 

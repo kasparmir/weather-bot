@@ -231,24 +231,30 @@ def _process_forecast(
     ledger: PaperLedger,
     target_date: date,
 ) -> dict | None:
-    """Najde Polymarket kontrakt a otevře pozici."""
+    """
+    Najde Polymarket kontrakt a otevře pozici.
+
+    Iteruje VŠECHNY markety eventu (seřazené od nejbližšího k předpovědi).
+    Pokud první selže na ceně nebo edge filtru, zkusí další — tak se
+    maximalizuje šance obchodovat každé město každý den.
+    """
     city_cfg = CITY_MAP.get(forecast.city)
     polymarket_name = city_cfg.polymarket_name if city_cfg else forecast.city.lower().replace(" ", "-")
 
     logger.info(
-        "Hledám trh: %s | předpověď %.1f°%s",
+        "Hledám trhy: %s | předpověď %.1f°%s",
         forecast.city, forecast.predicted_high, forecast.unit,
     )
 
-    market = gamma.find_weather_market(
+    markets = gamma.find_all_weather_markets(
         city_polymarket_name=polymarket_name,
         target_date=target_date,
         predicted_temp=forecast.predicted_high,
         unit=forecast.unit,
     )
 
-    if not market:
-        logger.info("  → Trh nenalezen pro %s", forecast.city)
+    if not markets:
+        logger.info("  → Žádný trh nenalezen pro %s", forecast.city)
         return {
             "city": forecast.city,
             "action": "NO_MARKET",
@@ -257,91 +263,85 @@ def _process_forecast(
             "reason": "market_not_found",
         }
 
+    skipped_reasons: list[str] = []
+
+    for market in markets:
+        logger.info(
+            "  → Zkouším: %s | YES=%.4f bestAsk=%.4f bestBid=%.4f",
+            market.market_slug, market.yes_price, market.best_ask, market.best_bid,
+        )
+
+        entry_price = market.yes_price
+
+        # Cena mimo rozsah: trhy pod 5 % nebo nad 85 % přeskočíme
+        if entry_price <= 0.05 or entry_price >= 0.85:
+            reason = f"entry_price mimo rozsah (0.05–0.85): {entry_price:.4f}"
+            logger.debug("  → Přeskakuji [%s]: %s", market.market_slug, reason)
+            skipped_reasons.append(f"{market.market_slug}: {reason}")
+            continue
+
+        # Edge filter
+        threshold, direction = extract_market_info(market.market_slug, market.question, forecast.unit)
+
+        if threshold is not None:
+            edge_result = check_edge(forecast, threshold, direction, entry_price)
+            if not edge_result.passes:
+                logger.debug("  → Přeskakuji [%s]: %s", market.market_slug, edge_result.reason)
+                skipped_reasons.append(f"{market.market_slug}: edge_filter ({edge_result.reason})")
+                continue
+        else:
+            logger.debug("  → Edge: práh nelze určit pro %s, pokračuji", market.market_slug)
+
+        # Otevři pozici
+        trade = ledger.open_position(
+            city=forecast.city,
+            target_date=target_date,
+            predicted_temp=forecast.predicted_high,
+            unit=forecast.unit,
+            market_slug=market.market_slug,
+            market_question=market.question,
+            entry_price=entry_price,
+        )
+
+        if not trade:
+            skipped_reasons.append(f"{market.market_slug}: ledger_rejected")
+            continue
+
+        edge_info: dict = {}
+        if threshold is not None:
+            er = compute_edge(forecast, threshold, direction, entry_price)
+            edge_info = {"our_probability": round(er.our_probability, 3), "edge": round(er.edge, 3)}
+
+        logger.info(
+            "  ✅ Otevřena pozice: %s @ %.4f%s",
+            market.market_slug, entry_price,
+            f" (P={edge_info.get('our_probability', 0):.1%} edge={edge_info.get('edge', 0):+.1%})" if edge_info else "",
+        )
+        return {
+            "city": forecast.city,
+            "action": "OPENED",
+            "trade_id": trade.id,
+            "market_slug": market.market_slug,
+            "predicted_temp": forecast.predicted_high,
+            "unit": forecast.unit,
+            "entry_price": entry_price,
+            "yes_price_pct": market.yes_price_pct,
+            "markets_tried": len(skipped_reasons) + 1,
+            **edge_info,
+        }
+
+    # Všechny markety selhaly
     logger.info(
-        "  → Nalezen: %s | YES=%.4f NO=%.4f bestAsk=%.4f bestBid=%.4f lastTrade=%.4f",
-        market.market_slug,
-        market.yes_price,
-        1.0 - market.yes_price,
-        market.best_ask,
-        market.best_bid,
-        market.last_trade_price,
+        "  ⏭️  Všechny markety přeskočeny (%d): %s",
+        len(skipped_reasons), "; ".join(skipped_reasons[:3]),
     )
-
-    entry_price = market.yes_price
-    # Horní limit 0.85: trhy nad 85% jsou téměř vyřešeny,
-    # žádný smysluplný edge a hrozí koupě při settlement ceně
-    if entry_price <= 0.05 or entry_price >= 0.85:
-        reason = f"entry_price mimo rozsah (0.05–0.85): {entry_price:.4f}"
-        logger.info("  → Přeskakuji: %s", reason)
-        return {
-            "city": forecast.city,
-            "action": "SKIPPED",
-            "market_slug": market.market_slug,
-            "predicted_temp": forecast.predicted_high,
-            "unit": forecast.unit,
-            "entry_price": entry_price,
-            "reason": reason,
-        }
-
-    # Edge filter
-    threshold: Optional[float] = None
-    direction: str = "unknown"
-    threshold, direction = extract_market_info(market.market_slug, market.question, forecast.unit)
-
-    if threshold is not None:
-        edge_result = check_edge(forecast, threshold, direction, entry_price)
-        if not edge_result.passes:
-            return {
-                "city": forecast.city,
-                "action": "SKIPPED",
-                "market_slug": market.market_slug,
-                "predicted_temp": forecast.predicted_high,
-                "unit": forecast.unit,
-                "entry_price": entry_price,
-                "our_probability": round(edge_result.our_probability, 3),
-                "edge": round(edge_result.edge, 3),
-                "reason": f"edge_filter: {edge_result.reason}",
-            }
-    else:
-        logger.debug("  Edge: práh nelze určit pro %s", market.market_slug)
-
-    # Otevři pozici
-    trade = ledger.open_position(
-        city=forecast.city,
-        target_date=target_date,
-        predicted_temp=forecast.predicted_high,
-        unit=forecast.unit,
-        market_slug=market.market_slug,
-        market_question=market.question,
-        entry_price=entry_price,
-    )
-
-    if not trade:
-        return {
-            "city": forecast.city,
-            "action": "SKIPPED",
-            "market_slug": market.market_slug,
-            "predicted_temp": forecast.predicted_high,
-            "unit": forecast.unit,
-            "entry_price": entry_price,
-            "reason": "ledger_rejected",
-        }
-
-    edge_info: dict = {}
-    if threshold is not None:
-        er = compute_edge(forecast, threshold, direction, entry_price)
-        edge_info = {"our_probability": round(er.our_probability, 3), "edge": round(er.edge, 3)}
-
     return {
         "city": forecast.city,
-        "action": "OPENED",
-        "trade_id": trade.id,
-        "market_slug": market.market_slug,
+        "action": "SKIPPED",
         "predicted_temp": forecast.predicted_high,
         "unit": forecast.unit,
-        "entry_price": entry_price,
-        "yes_price_pct": market.yes_price_pct,
-        **edge_info,
+        "reason": f"všechny markety selhaly ({len(skipped_reasons)}x): {skipped_reasons[0] if skipped_reasons else '?'}",
+        "markets_tried": len(markets),
     }
 
 

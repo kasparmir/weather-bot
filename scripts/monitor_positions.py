@@ -197,17 +197,17 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
         #    na P&L zisk >= PROFIT_TAKE_PCT (výchozí 50 %) a pak prodáme.
         #    Exit cena = entry_price * (1 + PROFIT_TAKE_PCT).
 
-        PROFIT_TAKE_PCT = float(os.getenv("DIVERGED_PROFIT_TAKE_PCT", "0.50"))
+        diverged_pct = float(os.getenv("DIVERGED_PROFIT_TAKE_PCT", "0.50"))
 
         if trade.forecast_diverged:
             # Čekáme na P&L zisk (ne absolutní cenu)
-            min_exit = trade.entry_price * (1.0 + PROFIT_TAKE_PCT)
+            min_exit = trade.entry_price * (1.0 + diverged_pct)
             if current_price >= min_exit:
                 pnl_pct_actual = (current_price / trade.entry_price - 1) * 100
                 logger.info(
                     "  🎯 PROFIT TAKE [DIVERGED]: %.4f >= %.4f (entry=%.4f +%.0f%%) | P&L=+%.1f%%",
                     current_price, min_exit, trade.entry_price,
-                    PROFIT_TAKE_PCT * 100, pnl_pct_actual,
+                    diverged_pct * 100, pnl_pct_actual,
                 )
                 closed_trade = ledger.close_position(
                     trade_id=trade.id,
@@ -235,7 +235,7 @@ def _check_position(trade: Trade, gamma: PolymarketGamma, ledger: PaperLedger) -
                 remaining = min_exit - current_price
                 logger.info(
                     "  🔶 DIVERGED: cena=%.4f, čeká na %.4f (+%.0f%% od entry) | zbývá +%.4f",
-                    current_price, min_exit, PROFIT_TAKE_PCT * 100, remaining,
+                    current_price, min_exit, diverged_pct * 100, remaining,
                 )
         else:
             # Normální podmínky — splnění JEDNÉ stačí:

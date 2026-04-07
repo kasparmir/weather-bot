@@ -5,16 +5,18 @@ Rozhoduje, zda vstoupit do pozice na základě rozdílu mezi
 naší odhadovanou pravděpodobností výhry a tržní cenou YES.
 
 Logika:
-  1. Forecast → pravděpodobnost (pomocí normálního rozdělení).
+  1. Forecast → pravděpodobnost.
+     a) Pokud jsou k dispozici probabilistické ensemble členy (50–160 hodnot
+        z ECMWF, GFS, ICON, GEM): empirické P(X > práh) = count / n.
+     b) Jinak: Gaussovská aproximace N(predicted, sigma).
   2. Edge = naše_prob - tržní_cena_YES.
-  3. Vstoupit pouze pokud Edge >= MIN_EDGE (výchozí 0.03 = 3 %).
-  4. Confidence weight: při vysokém std_dev (nejistá ensemble) snížit
-     efektivní pravděpodobnost a vyžadovat větší edge.
+  3. Vstoupit pouze pokud Edge >= MIN_EDGE (výchozí 2.5 %) AND P(YES) >= MIN_PROBABILITY.
 
 Konfigurace (env proměnné):
-  MIN_EDGE=0.03              # minimální edge pro vstup (výchozí 3 %)
-  FORECAST_SIGMA_F=3.0       # nejistota předpovědi v °F (výchozí ±3°F)
-  FORECAST_SIGMA_C=1.5       # nejistota předpovědi v °C (výchozí ±1.5°C)
+  MIN_EDGE=0.025             # minimální edge pro vstup
+  MIN_PROBABILITY=0.30       # minimální P(YES) — zabrání lottery-ticket trhům
+  FORECAST_SIGMA_F=2.0       # nejistota (fallback bez ensemble) v °F
+  FORECAST_SIGMA_C=1.1       # nejistota (fallback bez ensemble) v °C
   EDGE_ENSEMBLE_SIGMA=true   # použít std_dev z ensemble jako sigma (výchozí true)
 """
 
@@ -65,20 +67,23 @@ class EdgeResult:
     sigma_used: float           # nejistota použitá při výpočtu
     passes: bool                # True → vstoupit
     reason: str                 # lidsky čitelný důvod
+    prob_method: str = "gaussian"  # "empirical" | "gaussian"
+    prob_members: int = 0          # počet probabilistických členů (0 = Gaussian fallback)
 
     def log(self) -> None:
         icon = "✅" if self.passes else "⏭️"
+        method_str = f"empirical({self.prob_members})" if self.prob_method == "empirical" else f"gaussian(σ={self.sigma_used:.1f}°)"
         logger.info(
             "%s Edge %s: forecast=%.1f°%s | práh=%.1f°%s (%s) | "
-            "P(YES)=%.1f%% | tržní=%.1f%% | edge=%+.1f%% (min %.1f%%) | σ=%.1f°",
+            "P(YES)=%.1f%% [%s] | tržní=%.1f%% | edge=%+.1f%% (min %.1f%%)",
             icon, self.city,
             self.predicted_temp, self.unit,
             self.market_threshold, self.unit, self.market_direction,
             self.our_probability * 100,
+            method_str,
             self.market_price * 100,
             self.edge * 100,
             MIN_EDGE * 100,
-            self.sigma_used,
         )
 
 
@@ -107,33 +112,44 @@ def compute_edge(
     unit = forecast.unit
     predicted = forecast.predicted_high
 
-    # Sigma: z ensemble nebo výchozí hodnota
+    # Sigma pro Gaussovský fallback
     base_sigma = FORECAST_SIGMA_F if unit == "F" else FORECAST_SIGMA_C
     if USE_ENSEMBLE_SIGMA and forecast.std_dev > 0:
         sigma = max(base_sigma, forecast.std_dev)
     else:
         sigma = base_sigma
 
-    # Pravděpodobnost výhry podle směru kontraktu
-    our_prob = _compute_probability(
-        predicted=predicted,
-        threshold=market_threshold,
-        direction=market_direction,
-        sigma=sigma,
-    )
+    # Pravděpodobnost výhry:
+    #   Primárně: empirické P z probabilistických ensemble členů (50–160 hodnot).
+    #   Fallback: Gaussovská aproximace N(predicted, sigma).
+    prob_method = "gaussian"
+    prob_members_count = 0
+    members = getattr(forecast, "ensemble_members", [])
+
+    if members and len(members) >= 10:
+        our_prob = _compute_empirical_probability(members, market_threshold, market_direction)
+        prob_method = "empirical"
+        prob_members_count = len(members)
+    else:
+        our_prob = _compute_probability(
+            predicted=predicted,
+            threshold=market_threshold,
+            direction=market_direction,
+            sigma=sigma,
+        )
 
     edge = our_prob - market_price
     passes = edge >= MIN_EDGE and our_prob >= MIN_PROBABILITY
 
     if passes:
         reason = (f"edge {edge*100:+.1f}% >= min {MIN_EDGE*100:.1f}% "
-                  f"(P={our_prob*100:.1f}%, tržní={market_price*100:.1f}%)")
+                  f"(P={our_prob*100:.1f}%, tržní={market_price*100:.1f}%, {prob_method})")
     elif our_prob < MIN_PROBABILITY:
         reason = (f"P(YES) {our_prob*100:.1f}% < min {MIN_PROBABILITY*100:.0f}% "
-                  f"(edge {edge*100:+.1f}%, tržní={market_price*100:.1f}%)")
+                  f"(edge {edge*100:+.1f}%, {prob_method})")
     else:
         reason = (f"edge {edge*100:+.1f}% < min {MIN_EDGE*100:.1f}% "
-                  f"(P={our_prob*100:.1f}%, tržní={market_price*100:.1f}%)")
+                  f"(P={our_prob*100:.1f}%, tržní={market_price*100:.1f}%, {prob_method})")
 
     return EdgeResult(
         city=forecast.city,
@@ -147,6 +163,8 @@ def compute_edge(
         sigma_used=sigma,
         passes=passes,
         reason=reason,
+        prob_method=prob_method,
+        prob_members=prob_members_count,
     )
 
 
@@ -209,6 +227,42 @@ def _compute_probability(
         z = abs(threshold - predicted) / sigma
         prob = 1.0 - _normal_cdf(z)
         return max(0.05, min(0.95, 0.5 + (0.5 - prob) * math.copysign(1, predicted - threshold)))
+
+
+def _compute_empirical_probability(
+    members: list[float],
+    threshold: float,
+    direction: str,
+) -> float:
+    """
+    Empirická P(YES) z probabilistického ensemble (50–160 NWP členů).
+
+    Přímý count překračujících členů místo Gaussovské aproximace.
+    Výrazně přesnější při asymetrické distribuci nebo ostrém rozdělení.
+
+    Laplaceovo vyhlazení (+1 na každé straně) zabrání P=0% nebo P=100%.
+
+    Range market: šířka odvozena z unit (°F → ±0.5, °C → ±0.25 pro celé stupně;
+    pro desetinné prahy se použije přesný match).
+    """
+    n = len(members)
+    if n == 0:
+        return 0.5
+
+    if direction == "above":
+        count = sum(1 for m in members if m > threshold)
+    elif direction == "below":
+        count = sum(1 for m in members if m <= threshold)
+    elif direction == "range":
+        # Šířka: ±0.5° pro celočíselné prahy, ±0.25° pro desetinné
+        half = 0.5 if threshold == int(threshold) else 0.3
+        count = sum(1 for m in members if threshold - half <= m <= threshold + half)
+    else:
+        # Unknown: fallback na "above"
+        count = sum(1 for m in members if m > threshold)
+
+    # Laplaceovo vyhlazení — zabrání 0 % a 100 % při malém vzorku
+    return (count + 1) / (n + 2)
 
 
 def _normal_cdf(z: float) -> float:
